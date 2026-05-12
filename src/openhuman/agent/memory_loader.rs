@@ -10,10 +10,23 @@ use crate::openhuman::learning::transcript_ingest::CONVERSATION_MEMORY_NAMESPACE
 /// to recover continuity for high-importance facts, not to dump session
 /// history into context. See issue #1399.
 const PRIOR_CONVERSATION_LIMIT: usize = 3;
-/// Only the importance prefix `high.` survives into the prompt block.
-/// Medium/low entries stay queryable via the on-demand memory tool but
-/// do not auto-pollute every fresh chat.
-const PRIOR_CONVERSATION_KEY_PREFIX: &str = "high.";
+
+/// Importance-prefixed key prefixes that the prior-conversations block may
+/// surface. `high.*` rides the loader's default relevance gate; `med.*` is
+/// admitted under a noticeably stricter score floor (see
+/// [`MED_PRIOR_MIN_SCORE`]) so the block stays focused on signal users
+/// actually need across chats (#1505). `low.*` is intentionally absent and
+/// remains queryable only through the on-demand memory tool.
+const PRIOR_CONVERSATION_KEY_PREFIXES: &[&str] = &["high.", "med."];
+
+/// Minimum semantic-relevance score required for a `med.*` prior-
+/// conversation entry to auto-surface into the prompt. Substantially
+/// stricter than the loader's default `min_relevance_score` (0.4) — only
+/// medium-importance facts that the retriever judges *highly relevant* to
+/// the current user message earn a slot, so we recover useful cross-chat
+/// context (#1505) without re-introducing the "dump prior chat history into
+/// every fresh chat" failure mode that #1399 closed.
+const MED_PRIOR_MIN_SCORE: f64 = 0.65;
 
 #[async_trait]
 pub trait MemoryLoader: Send + Sync {
@@ -200,10 +213,33 @@ impl MemoryLoader for DefaultMemoryLoader {
         let mut prior_added = 0usize;
         for entry in prior_entries
             .into_iter()
-            .filter(|e| e.key.starts_with(PRIOR_CONVERSATION_KEY_PREFIX))
-            .filter(|e| match e.score {
-                Some(score) => score >= self.min_relevance_score,
-                None => true,
+            .filter(|e| {
+                PRIOR_CONVERSATION_KEY_PREFIXES
+                    .iter()
+                    .any(|prefix| e.key.starts_with(prefix))
+            })
+            .filter(|e| {
+                // Two-tier relevance gate so cross-chat context (#1505) can
+                // recover useful `med.*` facts when the retriever is very
+                // confident, while keeping #1399's "don't dump every prior
+                // chat" guarantee for the long tail of medium-importance
+                // entries. `high.*` keeps riding the loader's default
+                // `min_relevance_score`; `med.*` needs the stricter
+                // `MED_PRIOR_MIN_SCORE` floor. Entries without a score
+                // (e.g. exact-key matches from the memory tool) are kept
+                // only for `high.*` — for `med.*` we require a real
+                // semantic-relevance signal before admitting the row.
+                let is_high = e.key.starts_with("high.");
+                match e.score {
+                    Some(score) => {
+                        if is_high {
+                            score >= self.min_relevance_score
+                        } else {
+                            score >= MED_PRIOR_MIN_SCORE
+                        }
+                    }
+                    None => is_high,
+                }
             })
         {
             if prior_added >= PRIOR_CONVERSATION_LIMIT {
@@ -334,34 +370,89 @@ mod tests {
         }
     }
 
+    /// Helper for building a CONVERSATION_MEMORY_NAMESPACE entry with the
+    /// shape persisted by `transcript_ingest::persist` — importance-prefixed
+    /// key, two-line content (human-readable + provenance), optional score.
+    fn prior_entry(key: &str, line: &str, score: Option<f64>) -> MemoryEntry {
+        MemoryEntry {
+            id: format!("id-{key}"),
+            key: key.to_string(),
+            content: format!(
+                "{line}\n[provenance] {{\"thread_id\":\"thr_old\"}}"
+            ),
+            namespace: Some(super::CONVERSATION_MEMORY_NAMESPACE.to_string()),
+            category: MemoryCategory::Conversation,
+            timestamp: "2026-04-22T00:00:00Z".into(),
+            session_id: Some("thr_old".into()),
+            score,
+        }
+    }
+
     #[tokio::test]
-    async fn loader_surfaces_prior_conversation_high_importance_only() {
-        // Prior chat extracted two memories: one high-importance preference
-        // and one medium-importance unresolved task. Only the high one
-        // should make it into the loader's prompt block (#1399).
+    async fn loader_surfaces_high_importance_entries() {
+        // The original #1399 invariant: a high-importance prior fact above
+        // the default relevance gate surfaces into the prompt block and
+        // the raw `[provenance]` line is stripped before injection.
         let mem = MockMemory {
-            entries: vec![
-                MemoryEntry {
-                    id: "id-1".into(),
-                    key: "high.preference.aaaaaaaaaaaa".into(),
-                    content: "[high preference] I prefer Postgres for new services.\n[provenance] {\"thread_id\":\"thr_old\"}".into(),
-                    namespace: Some(super::CONVERSATION_MEMORY_NAMESPACE.to_string()),
-                    category: MemoryCategory::Conversation,
-                    timestamp: "2026-04-22T00:00:00Z".into(),
-                    session_id: Some("thr_old".into()),
-                    score: Some(0.9),
-                },
-                MemoryEntry {
-                    id: "id-2".into(),
-                    key: "med.unresolved_task.bbbbbbbbbbbb".into(),
-                    content: "[med unresolved_task] still need to migrate auth.".into(),
-                    namespace: Some(super::CONVERSATION_MEMORY_NAMESPACE.to_string()),
-                    category: MemoryCategory::Conversation,
-                    timestamp: "2026-04-22T00:00:00Z".into(),
-                    session_id: None,
-                    score: Some(0.9),
-                },
-            ],
+            entries: vec![prior_entry(
+                "high.preference.aaaaaaaaaaaa",
+                "[high preference] I prefer Postgres for new services.",
+                Some(0.9),
+            )],
+        };
+
+        let loader = DefaultMemoryLoader::default();
+        let out = loader
+            .load_context(&mem, "what should I default to for storage?")
+            .await
+            .expect("loader must succeed");
+
+        assert!(out.contains("[Prior conversations]"));
+        assert!(out.contains("Postgres"));
+        assert!(
+            !out.contains("[provenance]"),
+            "provenance is stripped from the prompt block, got:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn loader_surfaces_medium_importance_when_highly_relevant() {
+        // #1505 — medium-importance facts from another chat are valuable
+        // cross-chat context when the retriever is very confident they
+        // match the user's current request. With a score above the
+        // stricter `MED_PRIOR_MIN_SCORE` floor (0.65) they should now
+        // make it into the block.
+        let mem = MockMemory {
+            entries: vec![prior_entry(
+                "med.unresolved_task.bbbbbbbbbbbb",
+                "[med unresolved_task] still need to migrate auth to Postgres.",
+                Some(0.8),
+            )],
+        };
+
+        let loader = DefaultMemoryLoader::default();
+        let out = loader
+            .load_context(&mem, "what's outstanding on the auth migration?")
+            .await
+            .expect("loader must succeed");
+
+        assert!(out.contains("[Prior conversations]"), "got:\n{out}");
+        assert!(out.contains("migrate auth"), "got:\n{out}");
+    }
+
+    #[tokio::test]
+    async fn loader_excludes_medium_importance_below_stricter_score_floor() {
+        // The other half of #1505 — medium entries with only a so-so
+        // relevance match must NOT surface, otherwise we re-introduce
+        // the prompt-pollution failure mode #1399 closed. A score of
+        // 0.5 clears the default floor (0.4) but not the med-only floor
+        // (0.65), so the row should be dropped.
+        let mem = MockMemory {
+            entries: vec![prior_entry(
+                "med.unresolved_task.cccccccccccc",
+                "[med unresolved_task] tangentially related chore.",
+                Some(0.5),
+            )],
         };
 
         let loader = DefaultMemoryLoader::default();
@@ -371,18 +462,70 @@ mod tests {
             .expect("loader must succeed");
 
         assert!(
-            out.contains("[Prior conversations]"),
-            "expected prior conversations block, got:\n{out}"
+            !out.contains("[Prior conversations]"),
+            "block should be empty when nothing clears the gate, got:\n{out}"
         );
-        assert!(out.contains("Postgres"));
-        assert!(
-            !out.contains("migrate auth"),
-            "med-importance entries must not auto-surface, got:\n{out}"
-        );
-        assert!(
-            !out.contains("[provenance]"),
-            "provenance is not rendered into the prompt block, got:\n{out}"
-        );
+    }
+
+    #[tokio::test]
+    async fn loader_never_surfaces_low_importance_entries() {
+        // Low-importance entries are stored for audit only — they must
+        // not appear in the auto-injected block regardless of score.
+        let mem = MockMemory {
+            entries: vec![prior_entry(
+                "low.fact.dddddddddddd",
+                "[low fact] noisy detail nobody asked about.",
+                Some(0.95),
+            )],
+        };
+
+        let loader = DefaultMemoryLoader::default();
+        let out = loader
+            .load_context(&mem, "anything noisy?")
+            .await
+            .expect("loader must succeed");
+
+        assert!(!out.contains("[Prior conversations]"), "got:\n{out}");
+        assert!(!out.contains("noisy detail"), "got:\n{out}");
+    }
+
+    #[tokio::test]
+    async fn loader_mixed_importance_respects_per_tier_floors() {
+        // End-to-end sanity check with one of each tier so the tiered
+        // gate is exercised together: high passes on its lower floor,
+        // med passes only because its score clears the stricter floor,
+        // low drops despite a stellar score. Order in the prompt is
+        // whatever the underlying recall returned — we just assert
+        // membership.
+        let mem = MockMemory {
+            entries: vec![
+                prior_entry(
+                    "high.preference.aaaaaaaaaaaa",
+                    "[high preference] I prefer Postgres.",
+                    Some(0.45),
+                ),
+                prior_entry(
+                    "med.commitment.bbbbbbbbbbbb",
+                    "[med commitment] I'll migrate auth next sprint.",
+                    Some(0.7),
+                ),
+                prior_entry(
+                    "low.fact.cccccccccccc",
+                    "[low fact] dark mode looked nice yesterday.",
+                    Some(0.9),
+                ),
+            ],
+        };
+
+        let loader = DefaultMemoryLoader::default();
+        let out = loader
+            .load_context(&mem, "what do I prefer for storage and auth?")
+            .await
+            .expect("loader must succeed");
+
+        assert!(out.contains("Postgres"), "got:\n{out}");
+        assert!(out.contains("migrate auth"), "got:\n{out}");
+        assert!(!out.contains("dark mode"), "got:\n{out}");
     }
 
     #[tokio::test]
