@@ -9,6 +9,10 @@ import { fileURLToPath } from 'node:url';
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const HOOK = resolve(REPO_ROOT, '.husky/pre-push');
 const ZERO_OID = '0'.repeat(40);
+// Keep every git process off the developer's own config: a global
+// `commit.gpgsign` or `core.hooksPath` would fail these commits for reasons
+// that have nothing to do with the hook under test.
+const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
 
 const workspaces = [];
 after(() => {
@@ -16,7 +20,7 @@ after(() => {
 });
 
 function git(cwd, ...args) {
-  return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+  return execFileSync('git', args, { cwd, encoding: 'utf8', env: GIT_ENV }).trim();
 }
 
 /**
@@ -36,7 +40,7 @@ function workspace() {
   mkdirSync(repo);
   mkdirSync(bin);
 
-  execFileSync('git', ['init', '--quiet', '--bare', origin]);
+  execFileSync('git', ['init', '--quiet', '--bare', origin], { env: GIT_ENV });
   git(repo, 'init', '--quiet', '--initial-branch=main');
   git(repo, 'config', 'user.email', 'hook@test.local');
   git(repo, 'config', 'user.name', 'hook test');
@@ -77,7 +81,7 @@ function runHook(ws, refLines, { fail = '', env = {} } = {}) {
     encoding: 'utf8',
     input: refLines.map(line => `${line}\n`).join(''),
     env: {
-      ...process.env,
+      ...GIT_ENV,
       PATH: `${ws.bin}:${process.env.PATH}`,
       PNPM_LOG: ws.log,
       PNPM_FAIL: fail,
@@ -136,6 +140,13 @@ test('a push that touches a manifest still runs rust:clippy', () => {
   // A feature or dependency edit changes what compiles without touching a
   // single `.rs` file.
   const { ws, line } = pushOf('Cargo.toml', '[workspace]\n');
+  assert.equal(ranClippy(runHook(ws, [line])), true);
+});
+
+test('a push that touches .cargo config still runs rust:clippy', () => {
+  // Compiler flags, linker and target settings live there; they change what
+  // clippy sees without touching a `.rs` file.
+  const { ws, line } = pushOf('.cargo/config.toml', '[build]\n');
   assert.equal(ranClippy(runHook(ws, [line])), true);
 });
 

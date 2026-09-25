@@ -94,7 +94,7 @@ push_touches_rust() {
     return 0
   fi
   printf '%s\n' "$PUSHED_PATHS" | grep -Eq \
-    '(^|/)[^/]+\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain\.toml$|^crates/|^vendor/|^UNRESOLVED$'
+    '(^|/)[^/]+\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain\.toml$|^\.cargo/|^crates/|^vendor/|^UNRESOLVED$'
 }
 
 # Windows Git Bash can miss Node/Pnpm in PATH when hooks run.

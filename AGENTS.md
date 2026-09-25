@@ -554,7 +554,8 @@ serialization.
 - Use the issue and PR templates.
 - Fix hook failures caused by your changes.
 - `.husky/pre-push` runs `rust:clippy` only when the push carries Rust
-  (`*.rs`, a manifest, `crates/`, `vendor/`, `rust-toolchain.toml`); it runs
+  (`*.rs`, a manifest, `.cargo/`, `crates/`, `vendor/`,
+  `rust-toolchain.toml`); it runs
   anyway when the range cannot be resolved, or with
   `PRE_PUSH_FORCE_CLIPPY=1`. `scripts/__tests__/pre-push-hook.test.mjs`
   covers the hook.
