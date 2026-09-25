@@ -215,3 +215,32 @@ test('one Rust ref among several decides for the whole push', () => {
   ]);
   assert.equal(ranClippy(run), true);
 });
+
+// ── the token gates (#6533 defect 2) ───────────────────────────────────────
+
+test('a lint:commands-tokens failure fails the hook', () => {
+  // Regression for the defect: `$?` was read after `lint:ui-tokens`, so the
+  // commands-tokens exit was discarded and this push passed.
+  const { ws, line } = pushOf('docs/guide.md', 'docs only\n');
+  const run = runHook(ws, [line], { fail: 'lint:commands-tokens' });
+  assert.equal(run.status, 1, 'a failing lint:commands-tokens must fail the hook');
+  assert.match(run.stdout, /cmd-tokens/);
+});
+
+test('a lint:ui-tokens failure still fails the hook', () => {
+  const { ws, line } = pushOf('docs/guide.md', 'docs only\n');
+  assert.equal(runHook(ws, [line], { fail: 'lint:ui-tokens' }).status, 1);
+});
+
+test('both token lints run even when the first one fails', () => {
+  // Each has to report on its own; stopping at the first would hide the other.
+  const { ws, line } = pushOf('docs/guide.md', 'docs only\n');
+  const run = runHook(ws, [line], { fail: 'lint:commands-tokens' });
+  assert.ok(run.calls.includes('--dir app run lint:commands-tokens'));
+  assert.ok(run.calls.includes('--dir app run lint:ui-tokens'));
+});
+
+test('a clean push exits 0', () => {
+  const { ws, line } = pushOf('docs/guide.md', 'docs only\n');
+  assert.equal(runHook(ws, [line]).status, 0);
+});
