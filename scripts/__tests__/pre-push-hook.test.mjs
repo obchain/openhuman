@@ -155,6 +155,14 @@ test('a push that touches a vendored submodule path still runs rust:clippy', () 
   assert.equal(ranClippy(runHook(ws, [line])), true);
 });
 
+test('a push that bumps a submodule pointer still runs rust:clippy', () => {
+  // `[patch.crates-io]` resolves every vendored crate by path, so a pointer
+  // bump changes what the workspace compiles against. The Rust CI filters
+  // list `.gitmodules` for the same reason.
+  const { ws, line } = pushOf('.gitmodules', '[submodule "vendor/tinyagents"]\n');
+  assert.equal(ranClippy(runHook(ws, [line])), true);
+});
+
 test('a clippy failure in a Rust push still blocks it', () => {
   // The gate must not weaken the check it gates.
   const { ws, line } = pushOf('crates/openhuman-core/src/lib.rs', 'pub fn a() {}\n');
