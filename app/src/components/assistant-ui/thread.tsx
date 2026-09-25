@@ -32,6 +32,7 @@ import {
 } from '@/features/conversations/components/aui/auiThreadState';
 import { useT } from '@/lib/i18n/I18nContext';
 import { useAuiThreadId } from '@/providers/AssistantUiRuntimeProvider';
+import { CHAT_ERROR_METADATA_KEY } from '@/store/threadSlice';
 import { useActionBarReload, useMessageError } from '@assistant-ui/core/react';
 import {
   ActionBarMorePrimitive,
@@ -120,6 +121,10 @@ export type ThreadComponents = {
    * anything else.
    */
   ComposerExtras?: ComponentType | undefined;
+  /** Host-owned controls rendered in the right action cluster before voice. */
+  ComposerRightExtras?: ComponentType | undefined;
+  /** Host-owned navigation rail mounted inside the scrolling viewport. */
+  ConversationMap?: ComponentType | undefined;
   /** Full-width host content immediately above the composer shell. */
   ComposerHeader?: ComponentType | undefined;
   /**
@@ -383,7 +388,11 @@ const ThreadRoot: FC<{
   loadError: string | null;
   onEscape?: () => void;
 }> = ({ isEmpty, model, onModelChange, loadError, onEscape }) => {
-  const { Welcome = ThreadWelcome, Composer: HostComposer } = useContext(ThreadComponentsContext);
+  const {
+    Welcome = ThreadWelcome,
+    Composer: HostComposer,
+    ConversationMap,
+  } = useContext(ThreadComponentsContext);
   const viewportRef = useRef<HTMLDivElement>(null);
   const messageGroupRef = useRef<HTMLDivElement>(null);
   // Everything the viewport scrolls over, which is MORE than the message group:
@@ -415,6 +424,7 @@ const ThreadRoot: FC<{
         scrollToBottomOnRunStart={false}
         data-slot="aui_thread-viewport"
         className="relative flex flex-1 flex-col overflow-x-auto overflow-y-scroll scroll-smooth">
+        {ConversationMap ? <ConversationMap /> : null}
         <div
           ref={scrollContentRef}
           className={cn(
@@ -711,7 +721,8 @@ function useFollowBottom(
         followRef.current = true;
       } else if (
         viewport.scrollTop < lastScrollTopRef.current &&
-        (scrollbarDragActive || window.performance.now() - userIntentAt <= USER_SCROLL_INTENT_WINDOW_MS)
+        (scrollbarDragActive ||
+          window.performance.now() - userIntentAt <= USER_SCROLL_INTENT_WINDOW_MS)
       ) {
         followRef.current = false;
       }
@@ -1158,6 +1169,7 @@ const ComposerAction: FC<{
     hasComposerAttachments,
     onComposerAttachmentSend,
     ComposerIdleAction,
+    ComposerRightExtras,
     onSwitchToMicCloud,
   } = useContext(ThreadComponentsContext);
   const isRunning = useAuiState(state => state.thread.isRunning);
@@ -1175,6 +1187,7 @@ const ComposerAction: FC<{
         <ComposerExtrasSlot />
       </div>
       <div className="flex items-center gap-1.5">
+        {ComposerRightExtras ? <ComposerRightExtras /> : null}
         {onSwitchToMicCloud && (
           <TooltipIconButton
             tooltip="Voice mode"
@@ -1297,20 +1310,16 @@ const ComposerAction: FC<{
 };
 
 /**
- * The runtime's own error boundary for a message (`message.status.type ===
- * 'error'` — a throw from `onNew`/`onEdit`/`onReload`, not a `chat_error`
- * socket event, which instead lands as its own assistant reply — see
- * `ChatRuntimeProvider`'s `onError` handler).
+ * The runtime's error presentation for a failed message. The external-store
+ * projection marks persisted `chat_error` rows as incomplete/error, so they
+ * use this same card as errors raised directly by assistant-ui.
  *
- * `useMessageError`/`useActionBarReload` come straight from
- * `@assistant-ui/core/react` rather than through a primitive: there is no
- * primitive that hands back the raw error VALUE (only
- * `ErrorPrimitive.Message`, which renders it directly), and Retry needs the
- * same reload callback `ActionBarPrimitive.Reload` uses internally.
+ * `useMessageError` gives us the raw error value for the card. Failed turns
+ * have no committed assistant reply id for `threads.regenerate`, so this card
+ * must not offer Reload even when the runtime supports it for settled replies.
  */
 const MessageError: FC = () => {
   const error = useMessageError();
-  const { disabled: reloadDisabled, reload } = useActionBarReload();
   if (error === undefined) return null;
   const detail = typeof error === 'string' ? error : JSON.stringify(error);
   return (
@@ -1320,9 +1329,6 @@ const MessageError: FC = () => {
         title="Something went wrong"
         detail={detail}
         retrying={false}
-        onRetry={() => {
-          if (!reloadDisabled) reload();
-        }}
       />
     </MessagePrimitive.Error>
   );
@@ -1522,14 +1528,10 @@ const AssistantMessage: FC = () => {
                   </div>
                 );
               case 'indicator':
-                return (
-                  <span
-                    data-slot="aui_assistant-message-indicator"
-                    className="animate-pulse font-sans"
-                    aria-label="Assistant is working">
-                    {'●'}
-                  </span>
-                );
+                // The host RunningStatus slot renders the single shared loading
+                // state below the message group. Rendering assistant-ui's raw
+                // indicator part as well produces a second, disconnected dot.
+                return null;
               default:
                 return null;
             }
@@ -1560,13 +1562,21 @@ const AssistantActionBar: FC = () => {
   // Hoisted to a `const` rather than written inline for the same coverage
   // reason as `editAction` in `UserActionBar`.
   const canReload = useAuiReloadCapability();
-  const reloadAction = canReload ? (
-    <ActionBarPrimitive.Reload asChild>
-      <TooltipIconButton tooltip="Refresh">
-        <RefreshCwIcon />
-      </TooltipIconButton>
-    </ActionBarPrimitive.Reload>
-  ) : null;
+  const isFailedTurn = useAuiState(s => {
+    if (s.message.status?.type === 'incomplete' && s.message.status.reason === 'error') return true;
+    const custom = s.message.metadata?.custom as
+      | { extraMetadata?: Record<string, unknown> }
+      | undefined;
+    return custom?.extraMetadata?.[CHAT_ERROR_METADATA_KEY] !== undefined;
+  });
+  const reloadAction =
+    canReload && !isFailedTurn ? (
+      <ActionBarPrimitive.Reload asChild>
+        <TooltipIconButton tooltip="Refresh">
+          <RefreshCwIcon />
+        </TooltipIconButton>
+      </ActionBarPrimitive.Reload>
+    ) : null;
 
   return (
     <ActionBarPrimitive.Root

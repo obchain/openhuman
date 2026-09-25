@@ -9,6 +9,7 @@ import {
   type ComposioToolkitMeta,
   KNOWN_COMPOSIO_TOOLKITS,
 } from '../components/composio/toolkitMeta';
+import DesktopConnectionPage from '../components/desktop/DesktopConnectionPage';
 import EmptyStateCard from '../components/EmptyStateCard';
 import { ToastContainer } from '../components/intelligence/Toast';
 import PageSectionHeader from '../components/layout/PageSectionHeader';
@@ -17,6 +18,7 @@ import { SidebarContent } from '../components/layout/shell/SidebarSlot';
 import TwoPaneNav from '../components/layout/TwoPaneNav';
 import { SettingsLayoutProvider } from '../components/settings/layout/SettingsLayoutContext';
 import SettingsTabbedPage from '../components/settings/layout/SettingsTabbedPage';
+import BrowserConnectionsPanel from '../components/settings/panels/BrowserConnectionsPanel';
 import ComposioPanel from '../components/settings/panels/ComposioPanel';
 import EmbeddingsPanel from '../components/settings/panels/EmbeddingsPanel';
 import LlmConnectionsPanel from '../components/settings/panels/LlmConnectionsPanel';
@@ -449,9 +451,11 @@ type ConnectionsTab =
   | 'voice'
   | 'embeddings'
   | 'search'
+  | 'browser'
   | 'usage'
   | 'composio-key'
-  | 'wallet';
+  | 'wallet'
+  | 'desktop';
 
 /**
  * Tabs that render a relocated settings panel inside the shared card surface.
@@ -489,9 +493,11 @@ const SELF_HEADER_TABS: ReadonlySet<ConnectionsTab> = new Set<ConnectionsTab>([
   'voice',
   'embeddings',
   'search',
+  'browser',
   'composio-key',
   'usage',
   'wallet',
+  'desktop',
 ]);
 
 const INTELLIGENCE_TABS: ReadonlySet<ConnectionsTab> = new Set<ConnectionsTab>([
@@ -499,9 +505,11 @@ const INTELLIGENCE_TABS: ReadonlySet<ConnectionsTab> = new Set<ConnectionsTab>([
   'voice',
   'embeddings',
   'search',
+  'browser',
   'usage',
   'composio-key',
   'wallet',
+  'desktop',
 ]);
 
 export default function Skills() {
@@ -527,9 +535,11 @@ export default function Skills() {
       raw === 'voice' ||
       raw === 'embeddings' ||
       raw === 'search' ||
+      raw === 'browser' ||
       raw === 'usage' ||
       raw === 'composio-key' ||
-      raw === 'wallet'
+      raw === 'wallet' ||
+      raw === 'desktop'
     )
       return raw;
     // Legacy back-compat aliases
@@ -1012,6 +1022,11 @@ export default function Skills() {
                     icon: navIcon('M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z'),
                   },
                   {
+                    value: 'browser',
+                    label: t('connections.tabs.browser'),
+                    icon: navIcon('M3 5h18v14H3zM3 10h18M9 10v9'),
+                  },
+                  {
                     // Usage & limits (cost dashboard, token savings, background
                     // loops) relocated from Settings.
                     value: 'usage',
@@ -1019,6 +1034,16 @@ export default function Skills() {
                     icon: navIcon(
                       'M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z'
                     ),
+                  },
+                ],
+              },
+              {
+                label: t('connections.groups.desktop'),
+                items: [
+                  {
+                    value: 'desktop',
+                    label: t('desktop.title'),
+                    icon: navIcon('M4 5h16v11H4zM8 20h8m-4-4v4'),
                   },
                 ],
               },
@@ -1108,6 +1133,7 @@ export default function Skills() {
                     <EmbeddingsPanel embedded />
                   </SettingsTabbedPage>
                 )}
+                {activeTab === 'browser' && <BrowserConnectionsPanel />}
                 {activeTab === 'search' && (
                   <SettingsTabbedPage
                     title={t('settings.search.title')}
@@ -1130,6 +1156,7 @@ export default function Skills() {
                   </SettingsTabbedPage>
                 )}
                 {activeTab === 'wallet' && <WalletPanel />}
+                {activeTab === 'desktop' && <DesktopConnectionPage />}
               </SettingsLayoutProvider>
             ) : (
               <>

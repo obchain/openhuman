@@ -5,11 +5,124 @@ use std::sync::Arc;
 use tinyagents_runtime::ToolSnapshot;
 use tinytools::ToolSpec;
 
+/// A full progress channel must not discard the only terminal signal. A busy
+/// bridge can catch up after the turn commits; it cannot infer completion from
+/// an event that was dropped.
+#[tokio::test]
+async fn committed_turn_completion_waits_for_a_full_progress_channel() {
+    use crate::agent::progress::AgentProgress;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.send(AgentProgress::TurnStarted).await.unwrap();
+    let send = super::progress::send_committed_turn_progress(&tx, "question", "answer", 2);
+    tokio::pin!(send);
+    assert!(matches!(
+        futures::poll!(send.as_mut()),
+        std::task::Poll::Pending
+    ));
+
+    assert!(matches!(rx.recv().await, Some(AgentProgress::TurnStarted)));
+    assert!(send.await);
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("terminal progress event"),
+        Some(AgentProgress::TurnCompleted { iterations: 2 })
+    ));
+}
+
+/// A receiver can remain alive while its bridge is stalled. Once the send
+/// deadline passes, the committed chat response must still be able to return.
+#[tokio::test(start_paused = true)]
+async fn committed_turn_completion_is_bounded_when_progress_stalls() {
+    use crate::agent::progress::AgentProgress;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.send(AgentProgress::TurnStarted).await.unwrap();
+
+    assert!(!super::progress::send_committed_turn_progress(&tx, "question", "answer", 2).await);
+    assert!(matches!(rx.recv().await, Some(AgentProgress::TurnStarted)));
+    assert!(rx.try_recv().is_err(), "timed-out send must be cancelled");
+}
+
 fn spec(name: &str) -> ToolSpec {
     ToolSpec {
         name: name.into(),
         description: format!("{name} description"),
         parameters: serde_json::json!({ "type": "object", "properties": {} }),
+    }
+}
+
+#[cfg(feature = "modules")]
+#[tokio::test]
+async fn desktop_browser_setting_keeps_deferred_tools_in_fresh_and_resumed_surfaces() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(workspace.join("state")).expect("state dir");
+    // A desktop onboarding snapshot predating TinyBrowser has other enabled
+    // tools but cannot name browser/browser_open. The explicit Browser setting
+    // must still register both deferred tools for the user-facing session.
+    std::fs::write(
+        workspace.join("state/app-state.json"),
+        r#"{"onboardingTasks":{"enabledTools":["shell","file_read"]}}"#,
+    )
+    .expect("app state");
+    let mut config = crate::config::Config {
+        workspace_dir: workspace.clone(),
+        action_dir: workspace.clone(),
+        config_path: tmp.path().join("config.toml"),
+        ..Default::default()
+    };
+    config.browser.enabled = true;
+    config.http_request.allowed_domains = vec!["example.com".into()];
+    let mut host =
+        crate::agent::OpenHumanSessionHost::from_config_for_agent(&config, "orchestrator")
+            .expect("desktop orchestrator");
+    for name in ["browser", "browser_open"] {
+        assert!(host.deferred_tool_names_for_test().contains(name), "{name}");
+        assert!(!host
+            .visible_tool_specs_arc()
+            .iter()
+            .any(|spec| spec.name == name));
+    }
+    host.ensure_runtime_session().expect("runtime session");
+    let prelude = host
+        .runtime_state
+        .lock()
+        .expect("runtime state")
+        .prelude
+        .clone()
+        .expect("prelude");
+    let fresh = prelude.prepare(true).await.expect("fresh tool surface");
+    let fresh = fresh.tools.expect("fresh tools");
+    for name in ["browser", "browser_open"] {
+        assert!(fresh.specs().iter().any(|spec| spec.name == name), "{name}");
+    }
+    prelude.adopt_recorded_tools(Some(&fresh));
+    prelude.refresh_delegation_tool_surface();
+    let resumed = prelude.prepare(false).await.expect("resumed tool surface");
+    for name in ["browser", "browser_open"] {
+        assert!(
+            resumed
+                .tools
+                .as_ref()
+                .unwrap()
+                .specs()
+                .iter()
+                .any(|spec| spec.name == name),
+            "{name}"
+        );
+    }
+
+    config.browser.enabled = false;
+    let disabled =
+        crate::agent::OpenHumanSessionHost::from_config_for_agent(&config, "orchestrator")
+            .expect("browser-disabled orchestrator");
+    for name in ["browser", "browser_open"] {
+        assert!(
+            !disabled.deferred_tool_names_for_test().contains(name),
+            "{name}"
+        );
     }
 }
 

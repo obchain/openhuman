@@ -159,10 +159,10 @@ fn reuses_synthetic_tool_call_ids_in_a_later_turn() {
         "thr_synthetic",
         &[
             r#"{"role":"user","content":"one","request_id":"req-1"}"#,
-            r#"{"role":"assistant","content":"","tool_calls":[{"id":"call_0","name":"first","arguments":"{}"}],"request_id":"req-1"}"#,
+            r#"{"role":"assistant","content":"","provider":"test","model":"test","usage":{"input":1,"output":1,"cached_input":0,"cost_usd":0.0},"ts":"2026-07-21T00:00:01Z","tool_calls":[{"id":"call_0","name":"first","arguments":"{}"}],"request_id":"req-1"}"#,
             r#"{"role":"tool","content":"first result","id":"call_0","request_id":"req-1"}"#,
             r#"{"role":"user","content":"two","request_id":"req-2"}"#,
-            r#"{"role":"assistant","content":"","tool_calls":[{"id":"call_0","name":"second","arguments":"{}"}],"request_id":"req-2"}"#,
+            r#"{"role":"assistant","content":"","provider":"test","model":"test","usage":{"input":1,"output":1,"cached_input":0,"cost_usd":0.0},"ts":"2026-07-21T00:00:02Z","tool_calls":[{"id":"call_0","name":"second","arguments":"{}"}],"request_id":"req-2"}"#,
             r#"{"role":"tool","content":"second result","id":"call_0","request_id":"req-2"}"#,
         ],
     );
@@ -461,6 +461,7 @@ fn tool_failure_metadata_round_trips_write_to_display_line() {
         created: now.clone(),
         updated: now,
         turn_count: 1,
+        prefix_message_count: None,
         input_tokens: 0,
         output_tokens: 0,
         cached_input_tokens: 0,
@@ -542,6 +543,7 @@ fn append_transcript_turn_projects_full_display_shape() {
         created: now.clone(),
         updated: now,
         turn_count: 1,
+        prefix_message_count: None,
         input_tokens: 30,
         output_tokens: 13,
         cached_input_tokens: 0,

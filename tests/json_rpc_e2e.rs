@@ -5,6 +5,8 @@
 
 #[path = "support/memory_module.rs"]
 mod memory_module;
+#[path = "support/tinyhumans_boot.rs"]
+mod tinyhumans_boot;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -949,6 +951,14 @@ async fn read_sse_event_by_type(events_url: &str, target_event: &str) -> Value {
 /// This prevents tests from timing out blindly when the turn actually
 /// completed with `chat_error` rather than `chat_done`.
 async fn read_terminal_web_chat_event(events_url: &str) -> Value {
+    read_terminal_web_chat_event_with_ready(events_url, None, None).await
+}
+
+async fn read_terminal_web_chat_event_with_ready(
+    events_url: &str,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+    expected_request: Option<tokio::sync::oneshot::Receiver<String>>,
+) -> Value {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -965,6 +975,13 @@ async fn read_terminal_web_chat_event(events_url: &str) -> Value {
         resp.status(),
         events_url
     );
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
+    let expected_request_id = match expected_request {
+        Some(receiver) => Some(receiver.await.expect("accepted request id should be sent")),
+        None => None,
+    };
 
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
@@ -986,13 +1003,54 @@ async fn read_terminal_web_chat_event(events_url: &str) -> Value {
                 let value: Value = serde_json::from_str(&payload)
                     .unwrap_or_else(|e| panic!("invalid sse data json: {e}"));
                 match value.get("event").and_then(Value::as_str) {
-                    Some("chat_done") | Some("chat_error") => return value,
+                    Some("chat_done") | Some("chat_error")
+                        if expected_request_id.as_deref().is_none_or(|id| {
+                            value.get("request_id").and_then(Value::as_str) == Some(id)
+                        }) =>
+                    {
+                        return value;
+                    }
                     _ => {}
                 }
             }
         }
     }
     panic!("SSE stream ended before receiving terminal web-chat event");
+}
+
+async fn spawn_ready_terminal_web_chat_event_for_request(
+    events_url: &str,
+) -> (
+    tokio::task::JoinHandle<Value>,
+    tokio::sync::oneshot::Sender<String>,
+) {
+    // The previous turn can emit a late cancellation on the same client SSE
+    // stream. Subscribe before submitting, then match only the accepted turn.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let events_url = events_url.to_owned();
+    let task = tokio::spawn(async move {
+        read_terminal_web_chat_event_with_ready(&events_url, Some(ready_tx), Some(request_rx)).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        .await
+        .expect("SSE subscription should become ready")
+        .expect("SSE reader should signal readiness");
+    (task, request_tx)
+}
+
+fn signal_accepted_web_chat_request_id(
+    sender: tokio::sync::oneshot::Sender<String>,
+    accepted: &Value,
+) {
+    let request_id = accepted
+        .get("result")
+        .and_then(|result| result.get("request_id"))
+        .and_then(Value::as_str)
+        .expect("accepted web chat request_id");
+    sender
+        .send(request_id.to_owned())
+        .expect("SSE reader should receive request_id");
 }
 
 async fn wait_for_chat_completion_requests_len(expected_len: usize) -> Vec<Value> {
@@ -2286,8 +2344,15 @@ async fn json_rpc_protocol_auth_and_agent_hello_inner() {
     rpc_join.abort();
 }
 
-#[tokio::test]
-async fn json_rpc_prompt_injection_is_rejected_before_model_call() {
+#[test]
+fn json_rpc_prompt_injection_is_rejected_before_model_call() {
+    run_json_rpc_e2e_on_agent_stack(
+        "json_rpc_prompt_injection_is_rejected_before_model_call",
+        json_rpc_prompt_injection_is_rejected_before_model_call_inner,
+    );
+}
+
+async fn json_rpc_prompt_injection_is_rejected_before_model_call_inner() {
     let _env_lock = json_rpc_e2e_env_lock();
     let tmp = tempdir().expect("tempdir");
     let home = tmp.path();
@@ -2339,12 +2404,19 @@ async fn json_rpc_prompt_injection_is_rejected_before_model_call() {
     let web_msg = web_err
         .get("message")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+        .unwrap_or_default();
+    let web_verdict: Value = serde_json::from_str(
+        web_msg
+            .strip_prefix("GUARDRAIL:")
+            .unwrap_or_else(|| panic!("missing structured web guardrail: {web_err}")),
+    )
+    .expect("web guardrail verdict JSON");
+    assert_eq!(web_verdict["verdict"], "block", "{web_err}");
     assert!(
-        web_msg.contains("blocked by a security policy")
-            || web_msg.contains("flagged for security review"),
-        "unexpected web-block message: {web_err}"
+        web_verdict["reasons"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty()),
+        "blocked verdict should name its reasons: {web_err}"
     );
 
     let blocked_agent = post_json_rpc(
@@ -4479,8 +4551,7 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
     let client_id = "custom-provider-client";
     let thread_id = "custom-provider-thread";
     let events_url = format!("{}/events?client_id={}", rpc_base, client_id);
-    let sse_task =
-        tokio::spawn(async move { read_sse_event_by_type(&events_url, "chat_done").await });
+    let (sse_task, request_tx) = spawn_ready_terminal_web_chat_event_for_request(&events_url).await;
 
     let accepted = post_json_rpc(
         &rpc_base,
@@ -4500,6 +4571,7 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
             .and_then(|v| v.get("accepted")),
         Some(&json!(true))
     );
+    signal_accepted_web_chat_request_id(request_tx, accepted_result);
     let sse_event = tokio::time::timeout(Duration::from_secs(12), sse_task)
         .await
         .expect("timed out waiting for first custom-provider chat_done")
@@ -4507,22 +4579,28 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
     assert_eq!(
         sse_event.get("event").and_then(Value::as_str),
         Some("chat_done"),
-        "unexpected first custom-provider terminal event: {sse_event}; requests={:?}",
-        with_chat_completion_requests(|requests| requests.clone())
+        "unexpected first custom-provider terminal event: {sse_event}; request count={}",
+        with_chat_completion_requests(|requests| requests.len())
     );
 
     let requests = wait_for_chat_completion_requests_len(1).await;
     let custom_request = requests
         .iter()
         .find(|request| request.get("model").and_then(Value::as_str) == Some("gpt-4.1-mini"))
-        .unwrap_or_else(|| panic!("expected gpt-4.1-mini outbound provider call: {requests:?}"));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected gpt-4.1-mini among {} provider calls",
+                requests.len()
+            )
+        });
     assert_eq!(
         custom_request.get("path").and_then(Value::as_str),
         Some("/chat/completions")
     );
-    assert_eq!(
-        custom_request.get("authorization").and_then(Value::as_str),
-        Some("Bearer sk-custom-openai-key")
+    assert!(
+        custom_request.get("authorization").and_then(Value::as_str)
+            == Some("Bearer sk-custom-openai-key"),
+        "custom provider call must use its stored credential"
     );
 
     let update_again = post_json_rpc(
@@ -4537,7 +4615,7 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
     assert_no_jsonrpc_error(&update_again, "update_model_settings second");
 
     let events_url = format!("{}/events?client_id={}", rpc_base, client_id);
-    let sse_task = tokio::spawn(async move { read_terminal_web_chat_event(&events_url).await });
+    let (sse_task, request_tx) = spawn_ready_terminal_web_chat_event_for_request(&events_url).await;
 
     let accepted = post_json_rpc(
         &rpc_base,
@@ -4557,6 +4635,7 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
             .and_then(|v| v.get("accepted")),
         Some(&json!(true))
     );
+    signal_accepted_web_chat_request_id(request_tx, accepted_result);
     let sse_event = tokio::time::timeout(Duration::from_secs(12), sse_task)
         .await
         .expect("timed out waiting for second custom-provider chat_done")
@@ -4564,8 +4643,8 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
     assert_eq!(
         sse_event.get("event").and_then(Value::as_str),
         Some("chat_done"),
-        "unexpected second custom-provider terminal event: {sse_event}; requests={:?}",
-        with_chat_completion_requests(|requests| requests.clone())
+        "unexpected second custom-provider terminal event: {sse_event}; request count={}",
+        with_chat_completion_requests(|requests| requests.len())
     );
 
     let requests = wait_for_chat_completion_requests_len(2).await;
@@ -4573,20 +4652,24 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
         .iter()
         .find(|request| request.get("model").and_then(Value::as_str) == Some("gpt-4.1-nano"))
         .unwrap_or_else(|| {
-            panic!("expected gpt-4.1-nano outbound provider call after route change: {requests:?}")
+            panic!(
+                "expected gpt-4.1-nano among {} provider calls",
+                requests.len()
+            )
         });
     assert_eq!(
         updated_request.get("model").and_then(Value::as_str),
         Some("gpt-4.1-nano"),
         "cached web-chat session should rebuild when chat_provider changes"
     );
-    assert_eq!(
-        updated_request.get("authorization").and_then(Value::as_str),
-        Some("Bearer sk-custom-openai-key")
+    assert!(
+        updated_request.get("authorization").and_then(Value::as_str)
+            == Some("Bearer sk-custom-openai-key"),
+        "updated provider call must use its stored credential"
     );
 
     let events_url = format!("{}/events?client_id={}", rpc_base, client_id);
-    let sse_task = tokio::spawn(async move { read_terminal_web_chat_event(&events_url).await });
+    let (sse_task, request_tx) = spawn_ready_terminal_web_chat_event_for_request(&events_url).await;
 
     let accepted = post_json_rpc(
         &rpc_base,
@@ -4608,6 +4691,7 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
             .and_then(|v| v.get("accepted")),
         Some(&json!(true))
     );
+    signal_accepted_web_chat_request_id(request_tx, accepted_result);
     let sse_event = tokio::time::timeout(Duration::from_secs(12), sse_task)
         .await
         .expect("timed out waiting for unaffected agentic chat_done")
@@ -4615,8 +4699,8 @@ async fn json_rpc_web_chat_custom_chat_provider_uses_stored_key_and_rebuilds_on_
     assert_eq!(
         sse_event.get("event").and_then(Value::as_str),
         Some("chat_done"),
-        "unexpected unaffected-agentic terminal event: {sse_event}; requests={:?}",
-        with_chat_completion_requests(|requests| requests.clone())
+        "unexpected unaffected-agentic terminal event: {sse_event}; request count={}",
+        with_chat_completion_requests(|requests| requests.len())
     );
 
     let agentic_request = wait_for_chat_completion_request_with_message(
@@ -6490,6 +6574,198 @@ async fn json_rpc_local_ai_device_profile_and_presets() {
         "expected error for invalid tier: {bad_apply}"
     );
 
+    mock_join.abort();
+    rpc_join.abort();
+}
+
+/// Matrix 3.1.5 — the model context-window requirement gate, over RPC.
+///
+/// `local_ai.model_context_check` rejects installed Ollama models whose native
+/// context window is below the memory layer's minimum, so that "short-context
+/// models can't silently truncate and corrupt recall" (its own capability
+/// description). The rejection itself was asserted nowhere that runs:
+///
+///   * the implementation and its unit tests live in
+///     `vendor/tinyagents/vendor/tinyinference/crates/tinyinference-local/`,
+///     and `vendor` is in the root `[workspace] exclude` — no OpenHuman lane
+///     compiles that package, let alone runs its tests;
+///   * OpenHuman itself never names `model_requirements`, so there is no
+///     in-crate seam to unit-test the way `local_ai_presets_tests.rs` tests the
+///     preset mapping;
+///   * `openhuman.inference_diagnostics` was named by two live e2e targets, but
+///     only inside a schema-catalog list and an error-path table.
+///
+/// So the RPC boundary is the only place this behaviour is reachable from code
+/// this repo builds, and that is what this test drives: a mock Ollama serving
+/// one model below the floor and one comfortably above it, through
+/// `/api/tags` + `/api/show`, exactly as the real daemon would.
+///
+/// Deliberately asserts the *relationship* rather than the literal 8192:
+/// `min_context_tokens` is re-exported from
+/// `tinyinference_embeddings::RECOMMENDED_OLLAMA_CONTEXT_TOKENS` and is allowed
+/// to move. What must not change without someone noticing is that a model under
+/// whatever that floor is gets `below_minimum` and one over it gets `ok`.
+#[tokio::test]
+async fn json_rpc_local_ai_ollama_diagnostics_rejects_a_short_context_model() {
+    let _env_lock = json_rpc_e2e_env_lock();
+    let tmp = tempdir().expect("tempdir");
+    let home = tmp.path();
+    let openhuman_home = home.join(".openhuman");
+
+    let _home_guard = EnvVarGuard::set_to_path("HOME", home);
+    let _workspace_guard = EnvVarGuard::unset("OPENHUMAN_WORKSPACE");
+    let _backend_url_guard = EnvVarGuard::unset("BACKEND_URL");
+    let _vite_backend_guard = EnvVarGuard::unset("VITE_BACKEND_URL");
+    let _tier_guard = EnvVarGuard::unset("OPENHUMAN_LOCAL_AI_TIER");
+    let _ollama_env_guard = EnvVarGuard::unset("OPENHUMAN_OLLAMA_BASE_URL");
+
+    let (mock_addr, mock_join) = serve_on_ephemeral(mock_upstream_router()).await;
+    let mock_origin = format!("http://{}", mock_addr);
+    write_min_config(&openhuman_home, &mock_origin);
+
+    // Well under any plausible floor; the memory layer must refuse it.
+    const SHORT_CTX: u64 = 2_048;
+    // Comfortably over it.
+    const AMPLE_CTX: u64 = 131_072;
+    // The short-context model must be one the MVP chat allowlist accepts, or
+    // `effective_chat_model_id` rewrites the configured id to
+    // `MVP_DEFAULT_CHAT_MODEL` and `expected.chat_eligibility` resolves against
+    // a model this mock never lists. That rewrite is real behaviour, not a test
+    // artefact: under Ollama an off-allowlist chat model is redirected, so the
+    // realistic failure this gate exists for is the *allowlisted* model having
+    // too small a window.
+    const SHORT_MODEL: &str = "gemma3:1b-it-qat";
+    const AMPLE_MODEL: &str = "roomy-ctx:latest";
+
+    let ollama_app = Router::new()
+        .route(
+            "/api/tags",
+            get(|| async {
+                Json(json!({
+                    "models": [
+                        { "name": SHORT_MODEL, "size": 1_000_000, "modified_at": "2026-09-24T00:00:00Z" },
+                        { "name": AMPLE_MODEL, "size": 2_000_000, "modified_at": "2026-09-24T00:00:00Z" },
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/api/show",
+            post(|Json(body): Json<Value>| async move {
+                // `context_length_from_model_info` reads `{arch}.context_length`
+                // keyed off `general.architecture`; mirror that shape rather
+                // than a flattened convenience key, or the gate reads `Unknown`
+                // and this test would pass for the wrong reason.
+                let model = body.get("model").and_then(Value::as_str).unwrap_or_default();
+                let ctx = if model.starts_with("gemma3") {
+                    SHORT_CTX
+                } else {
+                    AMPLE_CTX
+                };
+                Json(json!({
+                    "model_info": {
+                        "general.architecture": "llama",
+                        "llama.context_length": ctx,
+                    },
+                    "capabilities": ["completion"],
+                }))
+            }),
+        );
+    let (ollama_addr, ollama_join) = serve_on_ephemeral(ollama_app).await;
+    let ollama_base = format!("http://{ollama_addr}");
+
+    let (rpc_addr, rpc_join) = serve_on_ephemeral(build_core_http_router(false)).await;
+    let rpc_base = format!("http://{}", rpc_addr);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let update = post_json_rpc(
+        &rpc_base,
+        60,
+        "openhuman.inference_update_local_settings",
+        json!({
+            "runtime_enabled": true,
+            "opt_in_confirmed": true,
+            "provider": "ollama",
+            "base_url": ollama_base,
+            "model_id": SHORT_MODEL,
+            "chat_model_id": SHORT_MODEL
+        }),
+    )
+    .await;
+    assert_no_jsonrpc_error(&update, "update_local_ai_settings_for_ollama");
+
+    let diagnostics =
+        post_json_rpc(&rpc_base, 61, "openhuman.inference_diagnostics", json!({})).await;
+    let result = assert_no_jsonrpc_error(&diagnostics, "ollama_context_diagnostics");
+
+    // The floor is reported, and it is a real number rather than a default 0 —
+    // a zero floor would accept everything and make the rest of this vacuous.
+    let floor = result
+        .get("context_requirement")
+        .and_then(|requirement| requirement.get("min_context_tokens"))
+        .and_then(Value::as_u64)
+        .expect("diagnostics must report the context floor");
+    assert!(
+        floor > SHORT_CTX && floor < AMPLE_CTX,
+        "this test's two fixtures must straddle the floor; floor={floor}, \
+         short={SHORT_CTX}, ample={AMPLE_CTX}"
+    );
+
+    let installed = result
+        .get("installed_models")
+        .and_then(Value::as_array)
+        .expect("diagnostics must list installed models");
+    assert_eq!(installed.len(), 2, "both mock models should be listed");
+
+    let eligibility_of = |name: &str| -> Value {
+        installed
+            .iter()
+            .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|entry| entry.get("eligibility"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+
+    let short = eligibility_of(SHORT_MODEL);
+    assert_eq!(
+        short.get("status").and_then(Value::as_str),
+        Some("below_minimum"),
+        "a {SHORT_CTX}-token model is under the {floor}-token floor and must be \
+         rejected, not merely reported: {short}"
+    );
+    assert_eq!(
+        short.get("context_length").and_then(Value::as_u64),
+        Some(SHORT_CTX),
+        "the rejection must carry the window it read, so the UI can say why"
+    );
+    assert_eq!(
+        short.get("required").and_then(Value::as_u64),
+        Some(floor),
+        "the rejection must carry the floor it was measured against"
+    );
+
+    let ample = eligibility_of(AMPLE_MODEL);
+    assert_eq!(
+        ample.get("status").and_then(Value::as_str),
+        Some("ok"),
+        "a {AMPLE_CTX}-token model is over the floor and must be accepted; if \
+         this is also below_minimum the gate is refusing everything: {ample}"
+    );
+
+    // The active chat model is the short one, so the expected-model verdict
+    // must carry the rejection too — this is the field the UI reads to warn.
+    assert_eq!(
+        result
+            .get("expected")
+            .and_then(|expected| expected.get("chat_eligibility"))
+            .and_then(|eligibility| eligibility.get("status"))
+            .and_then(Value::as_str),
+        Some("below_minimum"),
+        "the configured chat model is the short-context one; its eligibility \
+         must reflect that"
+    );
+
+    ollama_join.abort();
     mock_join.abort();
     rpc_join.abort();
 }
@@ -14407,8 +14683,16 @@ async fn json_rpc_commands_list_merges_builtins() {
     rpc_join.abort();
 }
 
-#[tokio::test]
-async fn json_rpc_threads_edit_message_truncates_and_restarts_turn() {
+#[test]
+fn json_rpc_threads_edit_message_truncates_and_restarts_turn() {
+    run_json_rpc_e2e_on_agent_stack(
+        "json_rpc_threads_edit_message_truncates_and_restarts_turn",
+        json_rpc_threads_edit_message_truncates_and_restarts_turn_inner,
+    );
+}
+
+async fn json_rpc_threads_edit_message_truncates_and_restarts_turn_inner() {
+    tinyhumans_boot::boot();
     // `threads.edit_message` (wire method `openhuman.threads_edit_message`)
     // cancels any in-flight turn, forks the session transcript + message log
     // to drop the edited message and everything after it, then restarts the
@@ -14431,12 +14715,27 @@ async fn json_rpc_threads_edit_message_truncates_and_restarts_turn() {
     let (api_addr, api_join) = serve_on_ephemeral(mock_upstream_router()).await;
     let api_origin = format!("http://{api_addr}");
     write_min_config(openhuman_home.as_path(), &api_origin);
+    write_min_config(&openhuman_home.join("users").join("e2e-user"), &api_origin);
 
     let (rpc_addr, rpc_join) = serve_on_ephemeral(build_core_http_router(false)).await;
     let rpc_base = format!("http://{rpc_addr}");
+    let store = post_json_rpc(
+        &rpc_base,
+        9599,
+        "openhuman.auth_store_session",
+        json!({ "token": "e2e-test-jwt", "user_id": "e2e-user" }),
+    )
+    .await;
+    assert_no_jsonrpc_error(&store, "store_session before edit");
 
     let client_id = "e2e-edit-client";
-    let thread_id = "thread-edit-e2e";
+    let create = post_json_rpc(&rpc_base, 9600, "openhuman.threads_create_new", json!({})).await;
+    let thread_id = assert_no_jsonrpc_error(&create, "threads_create_new before edit")
+        .get("data")
+        .and_then(|data| data.get("id"))
+        .and_then(Value::as_str)
+        .expect("created thread id")
+        .to_owned();
     let events_url = format!("{}/events?client_id={}", rpc_base, client_id);
 
     // The frontend — not the core — is the one that appends the user's own
@@ -14468,10 +14767,8 @@ async fn json_rpc_threads_edit_message_truncates_and_restarts_turn() {
 
     // --- Turn 1: a normal web-channel turn against the mock upstream, for
     // the same content just appended above. ---
-    let sse_task_1 = {
-        let events_url = events_url.clone();
-        tokio::spawn(async move { read_terminal_web_chat_event(&events_url).await })
-    };
+    let (sse_task_1, request_tx) =
+        spawn_ready_terminal_web_chat_event_for_request(&events_url).await;
     let turn1 = post_json_rpc(
         &rpc_base,
         9601,
@@ -14484,7 +14781,8 @@ async fn json_rpc_threads_edit_message_truncates_and_restarts_turn() {
         }),
     )
     .await;
-    assert_no_jsonrpc_error(&turn1, "channel_web_chat turn1");
+    let turn1_result = assert_no_jsonrpc_error(&turn1, "channel_web_chat turn1");
+    signal_accepted_web_chat_request_id(request_tx, turn1_result);
     let sse_event_1 = sse_task_1.await.expect("sse task 1 join should succeed");
     assert_eq!(
         sse_event_1.get("event").and_then(Value::as_str),
@@ -14518,10 +14816,8 @@ async fn json_rpc_threads_edit_message_truncates_and_restarts_turn() {
     // --- Edit the user message: cancels (no-op, turn1 already finished),
     // forks the transcript before turn1's user prompt, truncates the message
     // log from `user_message_id` onward, and restarts with new content. ---
-    let sse_task_2 = {
-        let events_url = events_url.clone();
-        tokio::spawn(async move { read_terminal_web_chat_event(&events_url).await })
-    };
+    let (sse_task_2, request_tx) =
+        spawn_ready_terminal_web_chat_event_for_request(&events_url).await;
     let edit = post_json_rpc(
         &rpc_base,
         9604,
@@ -14544,6 +14840,9 @@ async fn json_rpc_threads_edit_message_truncates_and_restarts_turn() {
         !new_request_id.is_empty(),
         "edit_message must return a non-empty request_id: {edit_outer}"
     );
+    request_tx
+        .send(new_request_id.to_owned())
+        .expect("SSE reader should receive edited turn request_id");
 
     let sse_event_2 = sse_task_2.await.expect("sse task 2 join should succeed");
     assert_eq!(
@@ -14595,8 +14894,16 @@ async fn json_rpc_threads_edit_message_truncates_and_restarts_turn() {
     rpc_join.abort();
 }
 
-#[tokio::test]
-async fn json_rpc_threads_regenerate_truncates_and_restarts_turn() {
+#[test]
+fn json_rpc_threads_regenerate_truncates_and_restarts_turn() {
+    run_json_rpc_e2e_on_agent_stack(
+        "json_rpc_threads_regenerate_truncates_and_restarts_turn",
+        json_rpc_threads_regenerate_truncates_and_restarts_turn_inner,
+    );
+}
+
+async fn json_rpc_threads_regenerate_truncates_and_restarts_turn_inner() {
+    tinyhumans_boot::boot();
     // `threads.regenerate` (wire method `openhuman.threads_regenerate`) with
     // no `message_id` redoes the thread's last turn: cancels any in-flight
     // turn, forks the transcript at `TruncateCut::LastAssistantTurn`, drops
@@ -14617,19 +14924,33 @@ async fn json_rpc_threads_regenerate_truncates_and_restarts_turn() {
     let (api_addr, api_join) = serve_on_ephemeral(mock_upstream_router()).await;
     let api_origin = format!("http://{api_addr}");
     write_min_config(openhuman_home.as_path(), &api_origin);
+    write_min_config(&openhuman_home.join("users").join("e2e-user"), &api_origin);
 
     let (rpc_addr, rpc_join) = serve_on_ephemeral(build_core_http_router(false)).await;
     let rpc_base = format!("http://{rpc_addr}");
 
+    let store = post_json_rpc(
+        &rpc_base,
+        9700,
+        "openhuman.auth_store_session",
+        json!({ "token": "e2e-test-jwt", "user_id": "e2e-user" }),
+    )
+    .await;
+    assert_no_jsonrpc_error(&store, "store_session before regenerate");
+
     let client_id = "e2e-regen-client";
-    let thread_id = "thread-regen-e2e";
+    let create = post_json_rpc(&rpc_base, 9699, "openhuman.threads_create_new", json!({})).await;
+    let thread_id = assert_no_jsonrpc_error(&create, "threads_create_new before regenerate")
+        .get("data")
+        .and_then(|data| data.get("id"))
+        .and_then(Value::as_str)
+        .expect("created thread id")
+        .to_owned();
     let events_url = format!("{}/events?client_id={}", rpc_base, client_id);
 
     // --- Turn 1: a normal web-channel turn against the mock upstream. ---
-    let sse_task_1 = {
-        let events_url = events_url.clone();
-        tokio::spawn(async move { read_terminal_web_chat_event(&events_url).await })
-    };
+    let (sse_task_1, request_tx) =
+        spawn_ready_terminal_web_chat_event_for_request(&events_url).await;
     let turn1 = post_json_rpc(
         &rpc_base,
         9701,
@@ -14651,6 +14972,7 @@ async fn json_rpc_threads_regenerate_truncates_and_restarts_turn() {
             panic!("expected request_id in channel_web_chat response: {turn1_result}")
         })
         .to_string();
+    signal_accepted_web_chat_request_id(request_tx, turn1_result);
     let sse_event_1 = sse_task_1.await.expect("sse task 1 join should succeed");
     assert_eq!(
         sse_event_1.get("event").and_then(Value::as_str),
@@ -14684,10 +15006,8 @@ async fn json_rpc_threads_regenerate_truncates_and_restarts_turn() {
     let before_count = before_messages.len();
 
     // --- Regenerate the last turn: no message_id, so it redoes turn1. ---
-    let sse_task_2 = {
-        let events_url = events_url.clone();
-        tokio::spawn(async move { read_terminal_web_chat_event(&events_url).await })
-    };
+    let (sse_task_2, request_tx) =
+        spawn_ready_terminal_web_chat_event_for_request(&events_url).await;
     let regen = post_json_rpc(
         &rpc_base,
         9703,
@@ -14712,6 +15032,9 @@ async fn json_rpc_threads_regenerate_truncates_and_restarts_turn() {
         new_request_id, turn1_request_id,
         "regenerate must restart under a fresh request_id"
     );
+    request_tx
+        .send(new_request_id.to_owned())
+        .expect("SSE reader should receive regenerated turn request_id");
 
     let sse_event_2 = sse_task_2.await.expect("sse task 2 join should succeed");
     assert_eq!(

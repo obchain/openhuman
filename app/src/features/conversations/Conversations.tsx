@@ -14,7 +14,6 @@ import { SidebarContent } from '../../components/layout/shell/SidebarSlot';
 import { ArtifactCardAdapter } from '../../features/conversations/aui/ArtifactCardAdapter';
 import { ContextUsage } from '../../features/conversations/aui/ContextUsage';
 import { PlanReviewCardCore } from '../../features/conversations/aui/PlanReviewPart';
-import { RunModeToggle } from '../../features/conversations/aui/RunModeToggle';
 import { toAuiTodoItems } from '../../features/conversations/aui/TodoListPart';
 import { useRunMode } from '../../features/conversations/aui/useRunMode';
 import {
@@ -33,7 +32,6 @@ import {
   getComposerBlockedSendFeedback,
   handleComposerSlashCommand,
 } from '../../features/conversations/composerSendDecision';
-import { useMemorySyncActive } from '../../features/conversations/hooks/useBackgroundActivity';
 import { selectBackgroundProcesses } from '../../features/conversations/selectors/backgroundProcesses';
 import {
   GENERAL_TAB_VALUE,
@@ -78,7 +76,6 @@ import { useAppDispatch, useAppSelector } from '../../store/hooks';
 import { pendingFollowupAdded } from '../../store/queueSlice';
 import { selectSocketStatus } from '../../store/socketSelectors';
 import {
-  addInferenceResponse,
   addMessageLocal,
   clearCreateThreadError,
   clearThreadInferenceActive,
@@ -512,7 +509,6 @@ const Conversations = ({
   // ids whose partial reply has already been persisted, so a repeated Stop/ESC
   // fired before the `cancelled` event clears the live stream can't append the
   // same partial twice.
-  const stoppedRequestIdsRef = useRef<Set<string>>(new Set());
   // Threads with an in-flight send, guarding against double-submit to the SAME
   // thread. Per-thread (a Set) so a send to thread B isn't blocked by an
   // in-flight send to thread A.
@@ -1303,40 +1299,16 @@ const Conversations = ({
   // Cancel control (mic-cloud / voice modes) so the cancel path lives in one
   // place.
   //
-  // Any assistant text already streamed for this turn is persisted as its own
-  // message flagged `stopped: true` so the partial output stays in the
-  // transcript (clearly marked) instead of vanishing when the `cancelled`
-  // chat_error clears the live streaming preview (#4862). The matching
-  // `onError` path deliberately appends no message for `cancelled`, so this can
-  // never double-render the partial reply.
-  //
-  // Persistence is gated on the cancel actually being accepted: `chatCancel`
-  // resolves `false` (no throw) when the socket is down or the RPC is rejected,
-  // and in that case the original turn may keep running and later append its
-  // own final response — so persisting a partial here would leave a
-  // misleading/duplicate bubble. On failure we release the one-shot claim so a
-  // retry can still preserve the partial once cancellation succeeds.
+  // `ChatRuntimeProvider.onCancelled` persists the partial and its processing
+  // trail after the core confirms cancellation. Keeping that in one place also
+  // covers turns superseded without a local Stop click.
   const handleStopGeneration = useCallback(() => {
     if (!selectedThreadId) {
       debug('[chat] stop generation: no selected thread — noop');
       return;
     }
     const threadId = selectedThreadId;
-    const streaming = streamingAssistantByThread[threadId];
-    const partial = streaming?.content ?? '';
-    const requestId = streaming?.requestId;
-    // Claim the turn synchronously so a second Stop/ESC in the same tick (before
-    // the cancel round-trips) can't queue a duplicate persist.
-    const shouldPersist =
-      partial.trim().length > 0 && (!requestId || !stoppedRequestIdsRef.current.has(requestId));
-    if (shouldPersist && requestId) stoppedRequestIdsRef.current.add(requestId);
-    debug(
-      '[chat] stop generation: thread=%s request=%s partialLen=%d willPersist=%s',
-      threadId,
-      requestId ?? 'none',
-      partial.trim().length,
-      shouldPersist
-    );
+    debug('[chat] stop generation: thread=%s', threadId);
     void chatCancel(threadId).then(outcome => {
       const accepted = outcome?.accepted === true;
       const turnCancelled = outcome?.turnCancelled === true;
@@ -1346,12 +1318,6 @@ const Conversations = ({
         accepted,
         turnCancelled
       );
-      if (!accepted || !turnCancelled) {
-        // Cancel not accepted, or the core had no turn to tear down: don't leave
-        // a misleading partial, and release the claim so a later Stop/ESC can
-        // persist once cancellation goes through.
-        if (shouldPersist && requestId) stoppedRequestIdsRef.current.delete(requestId);
-      }
       if (!accepted) return;
       if (!turnCancelled) {
         // The core has nothing running on this thread, so no `cancelled`
@@ -1374,26 +1340,8 @@ const Conversations = ({
         dispatch(clearThreadInferenceActive(threadId));
         return;
       }
-      if (shouldPersist) {
-        void dispatch(
-          addInferenceResponse({
-            content: partial,
-            threadId,
-            // `cancelReason: 'user_stop'` is what the vendored `StoppedRun`
-            // element's reason chip reads (`thread.tsx`'s `StoppedRunSlot`);
-            // this is the user-initiated Stop path, as opposed to the core
-            // superseding the turn (`chat_cancelled{cancel_reason:
-            // "superseded"}`, handled in `ChatRuntimeProvider`).
-            extraMetadata: {
-              stopped: true,
-              cancelReason: 'user_stop',
-              ...(requestId ? { requestId } : {}),
-            },
-          })
-        ).then(() => debug('[chat] stop generation: persisted stopped reply thread=%s', threadId));
-      }
     });
-  }, [selectedThreadId, streamingAssistantByThread, dispatch, clearSilenceTimer]);
+  }, [selectedThreadId, dispatch, clearSilenceTimer]);
 
   handleStopGenerationRef.current = handleStopGeneration;
 
@@ -1464,8 +1412,8 @@ const Conversations = ({
       ]
     : EMPTY_PROCESSING;
   // Detached background sub-agents (mode === 'async') spawned in this thread.
-  // The composer's background-processes badge needs the count/status, and
-  // `TranscriptOverlays` lists them.
+  // `TranscriptOverlays` keeps their panel mounted even while its composer
+  // shortcut is temporarily hidden.
   const backgroundProcesses = useMemo(
     () => selectBackgroundProcesses(selectedThreadToolTimeline),
     [selectedThreadToolTimeline]
@@ -1480,10 +1428,6 @@ const Conversations = ({
   useLoadThreadGoal(selectedThreadId ?? null);
   const liveTodos = useThreadTodos(selectedThreadId ?? null);
   const threadGoal = useThreadGoal(selectedThreadId ?? null);
-  const runningBackgroundCount = backgroundProcesses.filter(p => p.status === 'running').length;
-  // Poll-free live signal: lights the badge when memories are syncing even if
-  // no sub-agent is running and the panel is closed.
-  const memorySyncActive = useMemorySyncActive();
   // A plan the orchestrator parked for interactive review (request_plan_review
   // gate). When present, the PlanReviewCard renders above the composer and
   // resolves the parked turn.
@@ -1875,46 +1819,6 @@ const Conversations = ({
       <ChatFilesChip threadId={(selectedThreadId ?? firstActiveThreadId) as string} />
     ) : null;
 
-  // The control that opens the background-processes panel, plus its
-  // running-count / memory-sync badge. Opens `TranscriptOverlays`' panel.
-  const renderBackgroundProcessesButton = (onOpen: () => void) =>
-    selectedThreadId ? (
-      <button
-        type="button"
-        data-testid="background-processes-toggle"
-        data-analytics-id="chat-header-background-processes"
-        onClick={onOpen}
-        aria-label={t('conversations.backgroundTasks.title')}
-        title={
-          backgroundProcesses.length > 0
-            ? t('conversations.backgroundTasks.titleWithCount').replace(
-                '{count}',
-                String(backgroundProcesses.length)
-              )
-            : t('conversations.backgroundTasks.title')
-        }
-        className="relative flex h-7 w-7 items-center justify-center rounded-lg text-content-muted transition-colors hover:bg-surface-hover hover:text-content-secondary">
-        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            strokeWidth={2}
-            d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"
-          />
-        </svg>
-        {runningBackgroundCount > 0 ? (
-          <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-amber-500 px-0.5 text-[9px] font-semibold leading-none text-content-inverted">
-            {runningBackgroundCount}
-          </span>
-        ) : memorySyncActive ? (
-          <span
-            data-testid="background-activity-dot"
-            className="absolute -right-0.5 -top-0.5 h-2 w-2 animate-pulse rounded-full bg-amber-500"
-          />
-        ) : null}
-      </button>
-    ) : null;
-
   const assistantComposerHeader = (
     <>
       {/* Turn gates first: a parked plan review and a drafted workflow both
@@ -1950,13 +1854,7 @@ const Conversations = ({
   );
 
   // Left-hand controls in the assistant-ui composer toolbar.
-  const assistantComposerFooterExtras = (
-    <>
-      {renderBackgroundProcessesButton(() => setShowBackgroundProcesses(true))}
-      {chatFilesChip}
-      {selectedThreadId && <RunModeToggle threadId={selectedThreadId} />}
-    </>
-  );
+  const assistantComposerFooterExtras = <>{chatFilesChip}</>;
 
   // The mic-first (`mic-cloud`) composer. It replaces only the text composer:
   // the transcript above it is the same assistant-ui `Thread` as text mode, so

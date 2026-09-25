@@ -28,6 +28,9 @@ use super::announcement_notes::{
 };
 use super::types::OpenHumanSessionHost;
 
+#[path = "runtime_session_progress.rs"]
+mod progress;
+
 /// Mutable product state observed by the runtime hooks.
 ///
 /// This type has no message accumulator, raw transcript rows, prefix matching,
@@ -1304,7 +1307,7 @@ impl OpenHumanSessionHost {
         context.workspace = self.workspace_descriptor.clone();
         let cancellation = context.cancellation.clone();
         let root_config = context.root_run_config("openhuman-session");
-        let options = TurnOptions {
+        let mut options = TurnOptions {
             request_id: crate::agent::turn_origin::current_request_id(),
             thread_id: self.thread_id.clone(),
             stream: self.on_progress.is_some(),
@@ -1356,6 +1359,17 @@ impl OpenHumanSessionHost {
                     prelude.adopt_recorded_tools(recorded_tools.as_ref());
                 }
             }
+        }
+        // Resume restores the exact leading prompt messages from the durable
+        // transcript. Carry their count to the cache stamper: a later System
+        // compaction summary may be adjacent, but is not a frozen prompt tier.
+        let runtime = self
+            .runtime_session
+            .as_ref()
+            .expect("runtime session initialized");
+        let frozen_prefix_len = runtime.prefix_snapshot().messages().len();
+        if frozen_prefix_len > 0 || !runtime.history().is_empty() {
+            options.run_context.data.cacheable_system_prefix_len = Some(frozen_prefix_len);
         }
         let outcome = self
             .runtime_session
@@ -1432,14 +1446,19 @@ impl OpenHumanSessionHost {
         // than minting a new stem and resuming whichever one happens to be
         // newest. Everything else — sub-agents, unthreaded CLI turns — keeps
         // the stem path, where a fresh transcript per run is correct.
+        // The builder's initial binding and the per-turn resume hook must
+        // share one locator allocation. The runtime compares locator identity
+        // once a durable transcript is bound; separately constructed locators
+        // for the same workspace reject the first turn after a cold resume.
+        let session_locator = self.session_locator();
         let resume_target = match self.session.clone() {
             Some(session) => TranscriptTarget::for_session(
-                self.session_locator(),
+                session_locator.clone(),
                 session,
                 self.runtime_transcript_meta(),
             ),
             None => TranscriptTarget::new(
-                self.session_locator(),
+                session_locator.clone(),
                 self.runtime_transcript_stem(),
                 self.runtime_transcript_meta(),
             )
@@ -1771,22 +1790,19 @@ impl OpenHumanSessionHost {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .last_commit = Some(receipt);
-                        let mut state = state
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        state.last_turn_hit_cap = interrupted;
-                        state.last_turn_usage = Some(usage);
-                        state.last_turn_citations = citations;
+                        {
+                            let mut state = state
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            state.last_turn_hit_cap = interrupted;
+                            state.last_turn_usage = Some(usage);
+                            state.last_turn_citations = citations;
+                        }
                         if let Some(progress) = &progress {
-                            let _ = progress.try_send(
-                                crate::agent::progress::AgentProgress::TurnContent {
-                                    input: Some(input.clone()),
-                                    output: Some(output.clone()),
-                                },
-                            );
-                            let _ = progress.try_send(
-                                crate::agent::progress::AgentProgress::TurnCompleted { iterations },
-                            );
+                            let _ = progress::send_committed_turn_progress(
+                                progress, &input, &output, iterations,
+                            )
+                            .await;
                         }
                         crate::agent::hooks::fire_hooks(
                             &post_turn_hooks,
@@ -1831,11 +1847,7 @@ impl OpenHumanSessionHost {
             .hooks(hooks)
             .retain_recorded_tools(true);
         if let Some(session) = self.session.clone() {
-            builder = builder.session(
-                self.session_locator(),
-                session,
-                self.runtime_transcript_meta(),
-            );
+            builder = builder.session(session_locator, session, self.runtime_transcript_meta());
         }
         self.runtime_session = Some(
             builder
@@ -1929,6 +1941,7 @@ impl OpenHumanSessionHost {
             created: now.clone(),
             updated: now,
             turn_count: 0,
+            prefix_message_count: None,
             input_tokens: 0,
             output_tokens: 0,
             cached_input_tokens: 0,
