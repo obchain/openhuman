@@ -612,6 +612,43 @@ e2e-test-support = ["openhuman-core/e2e-test-support"]
   assert.deepEqual(result.staleExclusion, ['e2e-test-support']);
 });
 
+test('an exclusion for a gate no crate below declares any more is flagged as stale', () => {
+  // The other half of the stale check: once the core drops the gate, nothing
+  // declares it, so it stops appearing in the `allowed:` report too — and the
+  // entry would silently exclude a gate by that name if one ever came back.
+  const result = chainLink(
+    `
+[features]
+default = ["openhuman-core/default"]
+media = ["openhuman-core/media"]
+voice = ["openhuman-core/voice"]
+e2e-test-support = ["openhuman-core/e2e-test-support"]
+`,
+    [coreSource()],
+    { notForwarded: { 'peripheral-rpi': 'a gate the core deleted' } }
+  );
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.staleExclusion, ['peripheral-rpi']);
+  assert.match(formatChainReport(result), /no crate below declares it any more/);
+});
+
+test('a crate-local entry for a gate this crate no longer declares is flagged as stale', () => {
+  const result = chainLink(
+    `
+[features]
+default = ["openhuman-core/default"]
+media = ["openhuman-core/media"]
+voice = ["openhuman-core/voice"]
+e2e-test-support = ["openhuman-core/e2e-test-support"]
+`,
+    [coreSource()],
+    { localGates: { jev: 'This crate owns the gate.' } }
+  );
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.staleLocal, ['jev']);
+  assert.match(formatChainReport(result), /no longer does/);
+});
+
 test('a documented crate-local gate passes', () => {
   const result = chainLink(
     `

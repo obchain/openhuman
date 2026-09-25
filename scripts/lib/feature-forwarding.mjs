@@ -541,11 +541,23 @@ export function diffChainForwarding({
       !upstream.has(gate) && !Object.prototype.hasOwnProperty.call(localGates, gate)
   );
   // A "local" gate an upstream crate now declares is no longer local, and the
-  // entry would hide a genuinely missing forward for it.
-  const staleLocal = Object.keys(localGates).filter(gate => upstream.has(gate));
-  // Mirrors `diffForwarding`'s stale check: an exclusion for a gate that IS
-  // carried here is wrong, and would mask the day it gets dropped.
-  const staleExclusion = Object.keys(notForwarded).filter(gate => declared.has(gate));
+  // entry would hide a genuinely missing forward for it. One this crate has
+  // since dropped is stale for the opposite reason: it describes nothing, and
+  // would silently excuse a gate by that name the day one reappears.
+  const staleLocal = Object.keys(localGates).filter(
+    gate => upstream.has(gate) || !declared.has(gate)
+  );
+  // Mirrors `diffForwarding`'s stale check, in both directions: an exclusion
+  // for a gate that IS carried here is wrong and would mask the day it gets
+  // dropped, and an exclusion for a gate no source declares any more excuses a
+  // name that no longer exists — it also stops appearing in the `allowed:`
+  // report, so nothing draws attention to it.
+  const requiredUpstream = new Set(
+    sources.filter(source => source.required).flatMap(source => source.gates)
+  );
+  const staleExclusion = Object.keys(notForwarded).filter(
+    gate => declared.has(gate) || !requiredUpstream.has(gate)
+  );
   return {
     ok:
       missing.length === 0 &&
@@ -606,11 +618,17 @@ export function formatChainReport(result, { notForwarded = {} } = {}) {
     );
   }
   if (result.staleLocal.length > 0) {
-    lines.push('', 'Stale CHAIN_LOCAL_GATES entries (a crate below now declares the gate):');
+    lines.push(
+      '',
+      `Stale CHAIN_LOCAL_GATES entries (a crate below now declares the gate, or ${result.crate} no longer does):`
+    );
     for (const gate of result.staleLocal) lines.push(`  - ${gate}`);
   }
   if (result.staleExclusion.length > 0) {
-    lines.push('', 'Stale CHAIN_GATES_NOT_FORWARDED entries (the gate IS forwarded):');
+    lines.push(
+      '',
+      'Stale CHAIN_GATES_NOT_FORWARDED entries (the gate IS forwarded, or no crate below declares it any more):'
+    );
     for (const gate of result.staleExclusion) lines.push(`  - ${gate}`);
   }
   if (result.ok) lines.push(`  OK: forwards every gate of the crates below it.`);
