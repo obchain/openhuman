@@ -1,4 +1,5 @@
-use super::resolve_local_runtime_key;
+use super::{probe_auth_style, resolve_local_runtime_key};
+use crate::config::schema::cloud_providers::AuthStyle;
 use crate::config::Config;
 
 #[test]
@@ -8,6 +9,34 @@ fn omlx_key_falls_back_to_local_ai_api_key() {
     assert_eq!(
         resolve_local_runtime_key("omlx", String::new(), &config),
         "sk-omlx-list"
+    );
+}
+
+#[test]
+fn lmstudio_key_falls_back_to_local_ai_api_key() {
+    let mut config = Config::default();
+    config.local_ai.api_key = Some(" lm-key ".into());
+    assert_eq!(
+        resolve_local_runtime_key("lmstudio", String::new(), &config),
+        "lm-key"
+    );
+}
+
+#[test]
+fn lmstudio_probe_sends_bearer_only_when_a_key_is_configured() {
+    assert_eq!(
+        probe_auth_style("lmstudio", AuthStyle::None, "lm-key"),
+        AuthStyle::Bearer
+    );
+    assert_eq!(
+        probe_auth_style("lmstudio", AuthStyle::None, ""),
+        AuthStyle::None,
+        "an unauthenticated LM Studio keeps probing without a header"
+    );
+    assert_eq!(
+        probe_auth_style("ollama", AuthStyle::None, "key"),
+        AuthStyle::None,
+        "other keyless runtimes are unchanged"
     );
 }
 

@@ -8,10 +8,10 @@ use super::*;
 /// Resolve the API key used to probe a provider's `/models` endpoint.
 ///
 /// Cloud providers store their key in auth-profiles.json (via `lookup_key_for_slug`),
-/// but the OMLX local-runtime chip persists its Bearer key in
-/// `config.local_ai.api_key`. When the slug-scoped lookup comes back empty for omlx,
-/// fall back to that local-runtime key so the reachability probe still sends
-/// `Authorization: Bearer` (otherwise the OMLX server returns 401).
+/// but the OMLX and LM Studio local-runtime chips persist their Bearer key in
+/// `config.local_ai.api_key`. When the slug-scoped lookup comes back empty for
+/// those, fall back to that local-runtime key so the reachability probe still
+/// sends `Authorization: Bearer` (otherwise an authenticated server returns 401).
 pub(super) fn resolve_local_runtime_key(
     slug: &str,
     looked_up: String,
@@ -21,7 +21,7 @@ pub(super) fn resolve_local_runtime_key(
     if !looked_up.is_empty() {
         return looked_up;
     }
-    if slug == "omlx" {
+    if slug == "omlx" || slug == "lmstudio" {
         return config
             .local_ai
             .api_key
@@ -31,6 +31,25 @@ pub(super) fn resolve_local_runtime_key(
             .to_string();
     }
     looked_up
+}
+
+/// The auth style the `/models` probe uses for `entry`.
+///
+/// LM Studio's chip is stored with `AuthStyle::None` because the server runs
+/// unauthenticated by default. With "Require Authentication" on, the chat path
+/// already sends the configured key as a Bearer token (the local-runtime
+/// resolver keys on its presence), so the probe does the same.
+pub(super) fn probe_auth_style(
+    slug: &str,
+    auth_style: crate::config::schema::cloud_providers::AuthStyle,
+    api_key: &str,
+) -> crate::config::schema::cloud_providers::AuthStyle {
+    use crate::config::schema::cloud_providers::AuthStyle;
+    if slug == "lmstudio" && auth_style == AuthStyle::None && !api_key.is_empty() {
+        log::debug!("[providers][list_models] slug=lmstudio key configured; probing with Bearer");
+        return AuthStyle::Bearer;
+    }
+    auth_style
 }
 
 /// The key and HTTP client a registered catalog listing is handed for `entry`
@@ -216,7 +235,7 @@ pub async fn list_configured_models_from_config(
             .header(OPENAI_CODEX_ORIGINATOR_HEADER, OPENAI_CODEX_ORIGINATOR);
     }
 
-    request = match entry.auth_style {
+    request = match probe_auth_style(&entry.slug, entry.auth_style, &api_key) {
         AuthStyle::Bearer => {
             if !api_key.is_empty() {
                 let mut r = request.header("Authorization", format!("Bearer {}", api_key));
