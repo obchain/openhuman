@@ -68,6 +68,7 @@ async fn a_generated_title_does_not_overwrite_a_rename_made_while_titling() {
         workspace_dir_for_test().await,
         observed,
         "Summarized notes".to_string(),
+        "check my notes",
     )
     .await
     .expect("title write");
@@ -96,6 +97,43 @@ async fn a_generated_title_replaces_an_untouched_placeholder() {
         workspace_dir_for_test().await,
         observed,
         "Summarized notes".to_string(),
+        "check my notes",
+    )
+    .await
+    .expect("title write");
+    assert_eq!(returned.title, "Summarized notes");
+    assert_eq!(stored_thread(thread_id).await.title, "Summarized notes");
+}
+
+/// Two titling calls can both read the placeholder; the interim title the
+/// first one writes is not a rename and the second still replaces it.
+#[tokio::test]
+async fn a_generated_title_replaces_an_interim_title_written_meanwhile() {
+    let _env_lock = crate::config::TEST_ENV_LOCK.lock().await;
+    let workspace = tempfile::tempdir().expect("workspace");
+    let _workspace_guard = EnvVarGuard::set("OPENHUMAN_WORKSPACE", workspace.path());
+    let thread_id = "t-interim-meanwhile";
+    create_thread_with_title(&workspace, thread_id, "Chat Jan 1 1:00 AM").await;
+    let observed = stored_thread(thread_id).await;
+    let interim = tinyagents_harness::title::title_from_user_message("check my notes")
+        .expect("interim title");
+
+    thread_update_title(
+        &DispatchCtx::ambient(),
+        crate::threads::UpdateConversationThreadTitleRequest {
+            thread_id: thread_id.to_string(),
+            title: interim,
+        },
+    )
+    .await
+    .expect("interim write");
+
+    let returned = crate::threads::ops::support::update_title_unless_renamed(
+        &DispatchCtx::ambient(),
+        workspace_dir_for_test().await,
+        observed,
+        "Summarized notes".to_string(),
+        "check my notes",
     )
     .await
     .expect("title write");

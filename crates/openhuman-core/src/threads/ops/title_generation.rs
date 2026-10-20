@@ -199,15 +199,7 @@ pub async fn thread_generate_title(
         ));
     };
 
-    if title == thread.title {
-        return Ok(envelope(
-            thread_to_summary(thread),
-            Some(counts([("num_threads", 1)])),
-            None,
-        ));
-    }
-
-    let updated = update_title_unless_renamed(ctx, dir, thread, title)
+    let updated = update_title_unless_renamed(ctx, dir, thread, title, &first_user_message)
         .await
         .map_err(|err| ThreadsError::from_thread_scoped_store_error(&request.thread_id, err))?;
 
