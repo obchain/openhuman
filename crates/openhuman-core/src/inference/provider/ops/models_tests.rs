@@ -7,7 +7,7 @@ fn omlx_key_falls_back_to_local_ai_api_key() {
     let mut config = Config::default();
     config.local_ai.api_key = Some("  sk-omlx-list  ".into());
     assert_eq!(
-        resolve_local_runtime_key("omlx", String::new(), &config),
+        resolve_local_runtime_key("omlx", "", String::new(), &config),
         "sk-omlx-list"
     );
 }
@@ -16,9 +16,32 @@ fn omlx_key_falls_back_to_local_ai_api_key() {
 fn lmstudio_key_falls_back_to_local_ai_api_key() {
     let mut config = Config::default();
     config.local_ai.api_key = Some(" lm-key ".into());
+    config.local_ai.base_url = Some("http://127.0.0.1:4321/v1".into());
     assert_eq!(
-        resolve_local_runtime_key("lmstudio", String::new(), &config),
+        resolve_local_runtime_key(
+            "lmstudio",
+            "http://127.0.0.1:4321/v1/",
+            String::new(),
+            &config
+        ),
         "lm-key"
+    );
+}
+
+#[test]
+fn lmstudio_key_is_not_sent_to_another_endpoint() {
+    let mut config = Config::default();
+    config.local_ai.api_key = Some("lm-key".into());
+    config.local_ai.base_url = Some("http://127.0.0.1:4321/v1".into());
+    assert_eq!(
+        resolve_local_runtime_key(
+            "lmstudio",
+            "https://elsewhere.example/v1",
+            String::new(),
+            &config
+        ),
+        "",
+        "an lmstudio entry pointing away from local_ai does not get its key"
     );
 }
 
@@ -45,7 +68,7 @@ fn looked_up_key_wins_over_local_ai() {
     let mut config = Config::default();
     config.local_ai.api_key = Some("sk-local".into());
     assert_eq!(
-        resolve_local_runtime_key("omlx", "from-profiles".into(), &config),
+        resolve_local_runtime_key("omlx", "", "from-profiles".into(), &config),
         "from-profiles"
     );
 }
@@ -55,7 +78,7 @@ fn non_omlx_slug_does_not_fall_back() {
     let mut config = Config::default();
     config.local_ai.api_key = Some("sk-local".into());
     assert_eq!(
-        resolve_local_runtime_key("ollama", String::new(), &config),
+        resolve_local_runtime_key("ollama", "", String::new(), &config),
         ""
     );
 }

@@ -12,14 +12,29 @@ use super::*;
 /// `config.local_ai.api_key`. When the slug-scoped lookup comes back empty for
 /// those, fall back to that local-runtime key so the reachability probe still
 /// sends `Authorization: Bearer` (otherwise an authenticated server returns 401).
+///
+/// LM Studio's key only goes to the endpoint chat would send it to
+/// (`lm_studio_base_url` over `local_ai.base_url`), so an explicit `lmstudio`
+/// entry pointing elsewhere never receives it.
 pub(super) fn resolve_local_runtime_key(
     slug: &str,
+    endpoint: &str,
     looked_up: String,
     config: &crate::config::Config,
 ) -> String {
     let looked_up = looked_up.trim().to_string();
     if !looked_up.is_empty() {
         return looked_up;
+    }
+    if slug == "lmstudio" {
+        let configured =
+            tinyinference_local::lm_studio::lm_studio_base_url(config.local_ai.base_url.as_deref());
+        if endpoint.trim().trim_end_matches('/') != configured.trim_end_matches('/') {
+            log::debug!(
+                "[providers][list_models] slug=lmstudio endpoint differs from local_ai; not sending its key"
+            );
+            return looked_up;
+        }
     }
     if slug == "omlx" || slug == "lmstudio" {
         return config
@@ -65,7 +80,7 @@ fn catalog_request(
             let looked_up =
                 crate::inference::provider::factory::lookup_key_for_slug(&entry.slug, config)
                     .unwrap_or_default();
-            resolve_local_runtime_key(&entry.slug, looked_up, config)
+            resolve_local_runtime_key(&entry.slug, &entry.endpoint, looked_up, config)
         }
         None => String::new(),
     };
@@ -182,7 +197,7 @@ pub async fn list_configured_models_from_config(
 
     let looked_up = crate::inference::provider::factory::lookup_key_for_slug(&entry.slug, config)
         .unwrap_or_default();
-    let api_key = resolve_local_runtime_key(&entry.slug, looked_up, config);
+    let api_key = resolve_local_runtime_key(&entry.slug, &entry.endpoint, looked_up, config);
 
     let bearer_is_oauth = entry.slug == "openai"
         && crate::inference::provider::factory::openai_bearer_is_oauth(config);
