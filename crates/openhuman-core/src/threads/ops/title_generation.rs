@@ -1,7 +1,10 @@
 //! AI-assisted thread title generation, with fallback to a title derived
 //! straight from the user's first message when generation isn't possible.
 
-use super::support::{counts, envelope, thread_to_summary, update_thread_with_fallback_title};
+use super::support::{
+    counts, envelope, thread_to_summary, update_thread_with_fallback_title,
+    update_title_unless_renamed,
+};
 use crate::config::Config;
 use crate::core::runtime::DispatchCtx;
 use crate::core::Outcome;
@@ -204,15 +207,9 @@ pub async fn thread_generate_title(
         ));
     }
 
-    let updated = conversations::blocking::update_thread_title(
-        ctx.clone(),
-        dir,
-        request.thread_id.clone(),
-        title,
-        chrono::Utc::now().to_rfc3339(),
-    )
-    .await
-    .map_err(|err| ThreadsError::from_thread_scoped_store_error(&request.thread_id, err))?;
+    let updated = update_title_unless_renamed(ctx, dir, thread, title)
+        .await
+        .map_err(|err| ThreadsError::from_thread_scoped_store_error(&request.thread_id, err))?;
 
     tracing::debug!(
         thread_id = %request.thread_id,
