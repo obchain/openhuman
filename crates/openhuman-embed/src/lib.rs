@@ -83,13 +83,16 @@ pub use openhuman_core::config::{SearchHostCredential, UnknownKeyedSearchProvide
 pub use openhuman_core::core::runtime::{current_tenant, NoTenant, Tenant};
 pub use openhuman_core::security::TrustedAccess;
 pub use openhuman_core::tools::toolpacks::{GroupMode, ToolGroups};
+/// Reasoning effort values accepted by routed inference providers.
+pub use tinyinference_llm::model::ReasoningEffort;
 // The seam `AgentSpec::tools` needs: the belt types, and `Tool` itself from the
 // vendored tinytools. An embedder that took `tinytools` as its own dependency
 // would build tools of a different, incompatible type.
 pub use openhuman_core::agent::tinyagents::host::LastTurnUsage;
 pub use openhuman_core::agent::{HostAttachment, HostTools, HostTurnTools, TurnContext};
 pub use openhuman_core::{
-    CoreBuilder, CoreRuntime, DaemonConfig, DomainSet, HostKind, ServiceSet, TokenSource,
+    CoreBootMode, CoreBuilder, CoreRuntime, DaemonConfig, DomainSet, HostKind, ServiceSet,
+    TokenSource,
 };
 /// Declarative execution requirements for host-owned tools, from the core's vendored contract.
 pub use tinytools::ToolPolicy;
@@ -122,6 +125,12 @@ pub mod channels;
 pub mod chat_surface;
 pub mod complete;
 pub mod config;
+/// Pure command-line argument parsers shared by host-owned command facades.
+pub mod cli {
+    pub use openhuman_core::core::cli::{
+        parse_cli_args_after_launch_options, parse_function_params,
+    };
+}
 mod core_agent;
 pub mod cron;
 pub mod embeddings;
@@ -167,7 +176,8 @@ pub use openhuman_core::voice::VOICE_COMPILED_IN;
 pub use agent::ToolAttachmentError;
 pub use agent::{
     Agent, AgentDefinitionSpec, AgentError, AgentLayout, AgentSpec, ApprovalDecision, Approvals,
-    ApprovalsError, DefinitionBase, MemoryBinding, PendingApproval, SandboxModeSpec, ToolScopeSpec,
+    ApprovalsError, CompactOptions, CompactOutcome, DefinitionBase, MemoryBinding, MemoryBlockSpec,
+    PendingApproval, SandboxModeSpec, ToolScopeSpec,
 };
 pub use auth::{Auth, AuthState, Session};
 #[cfg(feature = "channels")]
@@ -238,15 +248,21 @@ pub mod seams {
 /// is held to. The persisted record types are the harness's own serde codecs,
 /// so hosts can encode and decode stored state without duplicating wire shapes.
 pub mod session_store {
-    pub use tinyagents_graph::todos::TodoList;
     pub use tinyagents_harness::events::{AgentEvent, HarnessRunStatus};
     pub use tinyagents_harness::ids::ExecutionStatus;
     pub use tinyagents_harness::observability::AgentObservation;
+    pub use tinyagents_harness_tools::todos::TodoList;
     pub use tinyagents_session::port::{AgentStores, SessionStoreProvider};
+    pub use tinyagents_session::port::{AppendStore, Store, TurnStates};
+    /// In-memory provider and contract suites for providers implemented by embedders.
+    #[cfg(feature = "testkit")]
     pub use tinyagents_session::port::{
-        AppendStore, InMemorySessionStores, InMemoryTranscriptLocator, InMemoryTurnStates, Store,
-        TurnStates,
+        InMemorySessionStores, InMemoryTranscriptLocator, InMemoryTurnStates,
     };
+    /// What a provider's `lease_for_agent` returns: stores the provider promises
+    /// stay bound to one backend for the life of the lease.
+    pub use tinyagents_session::port::{SessionStoreLease, SessionStoreLeaseError};
+    #[cfg(feature = "testkit")]
     pub use tinyagents_session::testkit::conformance::{
         session_store_conformance, session_store_isolation_conformance,
     };
@@ -266,7 +282,9 @@ pub use complete::{
     PhysicalDispatchOutcome, PhysicalDispatchStatus, PhysicalDispatchTerminal,
     PhysicalDispatchUsage,
 };
-pub use session_store::{InMemorySessionStores, SessionStoreProvider};
+#[cfg(feature = "testkit")]
+pub use session_store::InMemorySessionStores;
+pub use session_store::SessionStoreProvider;
 pub use turn::{absolute, Route, Turn, TurnOutcome, TurnRequest};
 pub use turn_cancellation::TurnCancellation;
 pub use turn_steering::{SteerRefused, TurnSteering};
