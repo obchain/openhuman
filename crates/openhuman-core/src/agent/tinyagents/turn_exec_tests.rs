@@ -325,7 +325,9 @@ fn hosted_roots_share_only_an_unconfigured_process_harness() {
 
     assert_eq!(first, second, "all roots enter the same durable harness");
     assert!(
-        root_hosted_harness().models().default_name().is_none(),
+        root_hosted_harness()
+            .preview_model_profile_for_request(&ModelRequest::default())
+            .is_none(),
         "models are invocation-local overlays, never mutable shared root state"
     );
     assert!(
@@ -546,6 +548,7 @@ async fn session_screens_the_new_input_but_not_a_replayed_tool_results_row() {
             // Splices rows into the head: the host writes through this store.
             .with_session_history_locator(Arc::clone(&locator))
             .chat_model(chat_model.clone())
+            .model_name("fixture/replay-screening".to_string())
             .tools(Vec::new())
             .workspace_dir(root.path().join("workspace"))
             .action_dir(root.path().to_path_buf())
