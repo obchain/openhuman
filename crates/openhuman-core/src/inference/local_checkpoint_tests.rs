@@ -1,12 +1,63 @@
 use super::*;
 use crate::config::rpc::LocalAiSettingsPatch;
 
-fn tmp_config(tmp: &tempfile::TempDir) -> Config {
-    let mut cfg = Config::default();
-    cfg.workspace_dir = tmp.path().join("workspace");
-    cfg.config_path = tmp.path().join("config.toml");
-    std::fs::create_dir_all(&cfg.workspace_dir).unwrap();
-    cfg
+/// One profile's config on disk; every step loads it fresh, as the RPC does.
+struct Profile {
+    dir: tempfile::TempDir,
+}
+
+impl Profile {
+    /// A profile with OMLX connected and keyed: the state a failed switch
+    /// must keep.
+    async fn with_omlx() -> Self {
+        let profile = Self::empty().await;
+        profile
+            .save(
+                connect("omlx", "http://127.0.0.1:8080/v1", "omlx-key"),
+                false,
+            )
+            .await;
+        profile
+    }
+
+    async fn empty() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.workspace_dir = dir.path().join("workspace");
+        cfg.config_path = dir.path().join("config.toml");
+        std::fs::create_dir_all(&cfg.workspace_dir).unwrap();
+        cfg.save().await.expect("initial save");
+        Self { dir }
+    }
+
+    async fn load(&self) -> Result<Config, String> {
+        Config::load_from_config_path_without_env(
+            &self.dir.path().join("config.toml"),
+            &self.dir.path().join("workspace"),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    async fn local_ai(&self) -> LocalAiConfig {
+        self.load().await.expect("load").local_ai
+    }
+
+    /// Saves `patch`; returns the checkpoint id when `checkpoint` is set.
+    async fn save(&self, patch: LocalAiSettingsPatch, checkpoint: bool) -> Option<String> {
+        let outcome = apply(|| self.load(), patch, checkpoint)
+            .await
+            .expect("save");
+        outcome.value["checkpoint_id"].as_str().map(str::to_string)
+    }
+
+    async fn attempt(&self, patch: LocalAiSettingsPatch) -> String {
+        self.save(patch, true).await.expect("checkpoint id")
+    }
+
+    async fn rollback(&self, id: &str) -> bool {
+        rollback(|| self.load(), id).await.expect("rollback")
+    }
 }
 
 fn connect(provider: &str, base_url: &str, api_key: &str) -> LocalAiSettingsPatch {
@@ -20,104 +71,83 @@ fn connect(provider: &str, base_url: &str, api_key: &str) -> LocalAiSettingsPatc
     }
 }
 
-fn checkpoint_id(outcome: &Outcome<Value>) -> String {
-    outcome.value["checkpoint_id"]
-        .as_str()
-        .expect("checkpoint id in the snapshot")
-        .to_string()
-}
-
-/// A saved OMLX runtime with its key, the state a failed switch must keep.
-async fn connected_omlx(tmp: &tempfile::TempDir) -> Config {
-    let mut cfg = tmp_config(tmp);
-    config_rpc::apply_local_ai_settings(
-        &mut cfg,
-        connect("omlx", "http://127.0.0.1:8080/v1", "omlx-key"),
-    )
-    .await
-    .expect("connect omlx");
-    cfg
+fn lm_studio(key: &str) -> LocalAiSettingsPatch {
+    connect("lm_studio", "http://127.0.0.1:1234/v1", key)
 }
 
 #[tokio::test]
 async fn a_failed_attempt_restores_the_previous_runtime_and_key() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = connected_omlx(&tmp).await;
+    let profile = Profile::with_omlx().await;
 
-    let outcome = apply_with_checkpoint(
-        &mut cfg,
-        connect("lm_studio", "http://127.0.0.1:1234/v1", "wrong-key"),
-    )
-    .await
-    .expect("attempt");
-    assert_eq!(cfg.local_ai.provider, "lm_studio");
+    let id = profile.attempt(lm_studio("wrong-key")).await;
+    assert_eq!(profile.local_ai().await.provider, "lm_studio");
 
-    assert!(rollback(&mut cfg, &checkpoint_id(&outcome))
-        .await
-        .expect("rollback"));
-    assert_eq!(cfg.local_ai.provider, "omlx");
+    assert!(profile.rollback(&id).await);
+    let restored = profile.local_ai().await;
+    assert_eq!(restored.provider, "omlx");
     assert_eq!(
-        cfg.local_ai.base_url.as_deref(),
+        restored.base_url.as_deref(),
         Some("http://127.0.0.1:8080/v1")
     );
-    assert_eq!(cfg.local_ai.api_key.as_deref(), Some("omlx-key"));
-
-    let on_disk: Config = toml::from_str(&std::fs::read_to_string(&cfg.config_path).unwrap())
-        .expect("saved config parses");
-    assert_eq!(on_disk.local_ai.provider, "omlx", "the restore is saved");
+    assert_eq!(restored.api_key.as_deref(), Some("omlx-key"));
+    assert!(
+        !profile.rollback(&id).await,
+        "a checkpoint is restored once"
+    );
 }
 
 #[tokio::test]
 async fn a_failed_first_connection_turns_the_runtime_back_off() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = tmp_config(&tmp);
-    let was_enabled = cfg.local_ai.runtime_enabled;
+    let profile = Profile::empty().await;
+    let before = profile.local_ai().await;
 
-    let outcome = apply_with_checkpoint(&mut cfg, connect("ollama", "http://127.0.0.1:11434", ""))
-        .await
-        .expect("attempt");
-    assert!(rollback(&mut cfg, &checkpoint_id(&outcome))
-        .await
-        .expect("rollback"));
-    assert_eq!(cfg.local_ai.runtime_enabled, was_enabled);
-    assert_eq!(cfg.local_ai.base_url, None);
+    let id = profile
+        .attempt(connect("ollama", "http://127.0.0.1:11434", ""))
+        .await;
+    assert!(profile.rollback(&id).await);
+    let after = profile.local_ai().await;
+    assert_eq!(after.runtime_enabled, before.runtime_enabled);
+    assert_eq!(after.base_url, None);
 }
 
 #[tokio::test]
 async fn an_older_attempts_rollback_does_not_undo_a_newer_save() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = connected_omlx(&tmp).await;
+    let profile = Profile::with_omlx().await;
 
-    let older = apply_with_checkpoint(&mut cfg, connect("ollama", "http://127.0.0.1:11434", ""))
-        .await
-        .expect("older attempt");
-    let newer = apply_with_checkpoint(
-        &mut cfg,
-        connect("lm_studio", "http://127.0.0.1:1234/v1", "lm-key"),
-    )
-    .await
-    .expect("newer attempt");
+    let older = profile
+        .attempt(connect("ollama", "http://127.0.0.1:11434", ""))
+        .await;
+    let newer = profile.attempt(lm_studio("lm-key")).await;
 
-    assert!(!rollback(&mut cfg, &checkpoint_id(&older))
-        .await
-        .expect("older rollback"));
-    assert_eq!(cfg.local_ai.provider, "lm_studio", "the newer save stands");
-    assert!(rollback(&mut cfg, &checkpoint_id(&newer))
-        .await
-        .expect("newer rollback"));
+    assert!(!profile.rollback(&older).await);
+    assert_eq!(
+        profile.local_ai().await.provider,
+        "lm_studio",
+        "the newer save stands"
+    );
+    assert!(profile.rollback(&newer).await);
+}
+
+/// Saving again, even the very same values, means the attempt's settings
+/// were chosen again: its rollback must not restore over them.
+#[tokio::test]
+async fn a_later_save_drops_the_checkpoint_even_with_the_same_values() {
+    let profile = Profile::with_omlx().await;
+
+    let id = profile.attempt(lm_studio("lm-key")).await;
+    profile.save(lm_studio("lm-key"), false).await;
+
+    assert!(!profile.rollback(&id).await);
+    assert_eq!(profile.local_ai().await.provider, "lm_studio");
 }
 
 #[tokio::test]
-async fn a_rollback_after_another_save_changes_nothing() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = connected_omlx(&tmp).await;
+async fn a_rollback_after_the_section_changed_elsewhere_changes_nothing() {
+    let profile = Profile::with_omlx().await;
 
-    let outcome = apply_with_checkpoint(
-        &mut cfg,
-        connect("lm_studio", "http://127.0.0.1:1234/v1", "lm-key"),
-    )
-    .await
-    .expect("attempt");
+    let id = profile.attempt(lm_studio("lm-key")).await;
+    // A writer outside `update_local_settings` (no checkpoint bookkeeping).
+    let mut cfg = profile.load().await.expect("load");
     config_rpc::apply_local_ai_settings(
         &mut cfg,
         LocalAiSettingsPatch {
@@ -128,32 +158,20 @@ async fn a_rollback_after_another_save_changes_nothing() {
     .await
     .expect("unrelated save");
 
-    assert!(!rollback(&mut cfg, &checkpoint_id(&outcome))
-        .await
-        .expect("rollback"));
-    assert_eq!(cfg.local_ai.provider, "lm_studio");
-    assert_eq!(cfg.local_ai.chat_model_id, "picked-later");
+    assert!(!profile.rollback(&id).await);
+    let current = profile.local_ai().await;
+    assert_eq!(current.provider, "lm_studio");
+    assert_eq!(current.chat_model_id, "picked-later");
 }
 
 #[tokio::test]
 async fn a_checkpoint_only_restores_into_its_own_config() {
-    let a_dir = tempfile::tempdir().unwrap();
-    let b_dir = tempfile::tempdir().unwrap();
-    let mut a = connected_omlx(&a_dir).await;
-    let mut b = connected_omlx(&b_dir).await;
+    let a = Profile::with_omlx().await;
+    let b = Profile::with_omlx().await;
 
-    let outcome = apply_with_checkpoint(
-        &mut a,
-        connect("lm_studio", "http://127.0.0.1:1234/v1", "lm-key"),
-    )
-    .await
-    .expect("attempt on a");
+    let id = a.attempt(lm_studio("lm-key")).await;
 
-    assert!(!rollback(&mut b, &checkpoint_id(&outcome))
-        .await
-        .expect("rollback on b"));
-    assert_eq!(b.local_ai.provider, "omlx");
-    assert!(rollback(&mut a, &checkpoint_id(&outcome))
-        .await
-        .expect("rollback on a"));
+    assert!(!b.rollback(&id).await);
+    assert_eq!(b.local_ai().await.provider, "omlx");
+    assert!(a.rollback(&id).await);
 }

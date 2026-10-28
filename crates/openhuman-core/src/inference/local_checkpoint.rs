@@ -4,9 +4,14 @@
 //! answers, and it never reads the stored key back, so it cannot restore the
 //! previous settings itself. A checkpointed update keeps the prior `local_ai`
 //! section here, in the core, and returns an opaque id. Rolling back that id
-//! restores the prior section only while `local_ai` still holds exactly what
-//! the attempt wrote: a newer save, from another attempt or anywhere else,
-//! wins over an older attempt's rollback.
+//! restores the prior section only while it is still this config's latest
+//! checkpoint and `local_ai` still holds exactly what the attempt wrote: any
+//! later save through `update_local_settings` drops the checkpoint, so an
+//! older attempt never undoes a newer save.
+//!
+//! Every load-modify-save here runs under one lock, with the config loaded
+//! after the lock is taken, so two attempts cannot record each other's stale
+//! snapshot as their prior state.
 
 use crate::config::rpc as config_rpc;
 use crate::config::schema::LocalAiConfig;
@@ -14,6 +19,7 @@ use crate::config::Config;
 use crate::core::Outcome;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use tokio::sync::Mutex;
@@ -35,22 +41,36 @@ fn section(config: &Config) -> Result<Value, String> {
     serde_json::to_value(&config.local_ai).map_err(|e| format!("serialize local_ai: {e}"))
 }
 
-/// Applies `patch` and records the prior `local_ai` for [`rollback`]. The
-/// returned snapshot carries the checkpoint id as `checkpoint_id`.
-pub(crate) async fn apply_with_checkpoint(
-    config: &mut Config,
+/// Loads the config, applies `patch` and saves it. With `checkpoint`, the
+/// prior `local_ai` is kept for [`rollback`] and the returned snapshot
+/// carries its id as `checkpoint_id`; without it, any pending checkpoint for
+/// this config is dropped, since the settings have been saved again.
+pub(crate) async fn apply<F, Fut>(
+    load: F,
     patch: config_rpc::LocalAiSettingsPatch,
-) -> Result<Outcome<Value>, String> {
+    checkpoint: bool,
+) -> Result<Outcome<Value>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Config, String>>,
+{
     let mut checkpoints = CHECKPOINTS.lock().await;
+    let mut config = load().await?;
     let prior = config.local_ai.clone();
-    let mut outcome = config_rpc::apply_local_ai_settings(config, patch).await?;
+    let mut outcome = config_rpc::apply_local_ai_settings(&mut config, patch).await?;
+    if !checkpoint {
+        if checkpoints.remove(&config.config_path).is_some() {
+            debug!("{LOG_PREFIX} pending checkpoint dropped by a later save");
+        }
+        return Ok(outcome);
+    }
     let id = uuid::Uuid::new_v4().to_string();
     checkpoints.insert(
         config.config_path.clone(),
         Checkpoint {
             id: id.clone(),
             prior,
-            written: section(config)?,
+            written: section(&config)?,
         },
     );
     debug!("{LOG_PREFIX} checkpoint recorded id={id}");
@@ -62,9 +82,15 @@ pub(crate) async fn apply_with_checkpoint(
 
 /// Restores the `local_ai` section recorded under `id`. Returns `false`, and
 /// changes nothing, when `id` is not this config's latest checkpoint or the
-/// section has changed since that attempt wrote it.
-pub(crate) async fn rollback(config: &mut Config, id: &str) -> Result<bool, String> {
+/// section has changed since that attempt wrote it. The checkpoint is kept
+/// until the restored config is saved, so a failed save can be retried.
+pub(crate) async fn rollback<F, Fut>(load: F, id: &str) -> Result<bool, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Config, String>>,
+{
     let mut checkpoints = CHECKPOINTS.lock().await;
+    let mut config = load().await?;
     let Some(checkpoint) = checkpoints.get(&config.config_path) else {
         debug!("{LOG_PREFIX} rollback skipped id={id}: no checkpoint");
         return Ok(false);
@@ -73,19 +99,17 @@ pub(crate) async fn rollback(config: &mut Config, id: &str) -> Result<bool, Stri
         debug!("{LOG_PREFIX} rollback skipped id={id}: superseded by a newer attempt");
         return Ok(false);
     }
-    if section(config)? != checkpoint.written {
+    if section(&config)? != checkpoint.written {
         debug!("{LOG_PREFIX} rollback skipped id={id}: local_ai changed since the attempt");
         checkpoints.remove(&config.config_path);
         return Ok(false);
     }
-    let Some(checkpoint) = checkpoints.remove(&config.config_path) else {
-        return Ok(false);
-    };
-    config.local_ai = checkpoint.prior;
+    config.local_ai = checkpoint.prior.clone();
     config
         .save()
         .await
         .map_err(|e| format!("save config: {e}"))?;
+    checkpoints.remove(&config.config_path);
     debug!("{LOG_PREFIX} rollback restored id={id}");
     Ok(true)
 }
